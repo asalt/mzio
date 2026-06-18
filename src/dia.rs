@@ -1,0 +1,3513 @@
+use std::collections::BTreeMap;
+use std::env;
+use std::fmt::Write as _;
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::Context;
+use libloading::Library;
+use mzdata::io::SpectrumSource;
+use serde::Deserialize;
+use timsrust::converters::ConvertableDomain;
+use timsrust::readers::{FrameReader, MetadataReader};
+use timsrust::{AcquisitionType, Frame, MSLevel, Metadata};
+
+use crate::annotate::{
+    fragment_charge_states, generate_fragments, prepare_annotation, FragmentIon, FragmentSeries,
+    MassTolerance,
+};
+use crate::mzml::{load_spectrum_by_index, open_reader};
+use crate::scale::CoordinateRange;
+use crate::svg_canvas::{AxisOrientation, AxisProps, AxisTickLabelStyle, SvgCanvas};
+
+const BRUKER_BRIDGE_PY: &str = include_str!("dia_bruker_bridge.py");
+const DEFAULT_MZ_PPM: f64 = 20.0;
+const DEFAULT_MZ_PROFILE_BINS: usize = 160;
+const DEFAULT_BRUKER_SO_PATHS: &[&str] =
+    &["/opt/bruker/linux64/timsdata.so", "/opt/bruker/timsdata.so"];
+const BRUKER_SO_ENV_VAR: &str = "MZIO_BRUKER_SO";
+const BRUKER_PYTHON_ENV_VAR: &str = "MZIO_PYTHON";
+const DEFAULT_PEPTIDE_CHARGE: i32 = 2;
+const DEFAULT_PSEUDO_MS2_RT_WINDOW_MIN: f64 = 0.5;
+const SVG_WIDTH: u32 = 1320;
+const SVG_HEIGHT: u32 = 980;
+const SVG_MARGIN_X: f64 = 60.0;
+const SVG_TITLE_FONT: f64 = 28.0;
+const SVG_META_FONT: f64 = 15.0;
+const SVG_PANEL_TITLE_FONT: f64 = 22.0;
+const SVG_TICK_FONT: f64 = 14.0;
+const SVG_AXIS_LABEL_FONT: f64 = 16.0;
+const COLOR_TEXT: &str = "#122033";
+const COLOR_SUBTLE: &str = "#5b6775";
+const COLOR_CARD_BORDER: &str = "#d8e0ea";
+const COLOR_AXIS: &str = "#334155";
+const COLOR_RT: &str = "#1d4ed8";
+const COLOR_MZ: &str = "#b45309";
+const COLOR_GRID: &str = "#e5ebf2";
+const COLOR_BG: &str = "#ffffff";
+
+#[derive(Clone, Debug)]
+enum DiaInput {
+    Bruker(PathBuf),
+    Mzml(PathBuf),
+}
+
+impl DiaInput {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Bruker(path) | Self::Mzml(path) => path.as_path(),
+        }
+    }
+
+    fn default_stem(&self) -> String {
+        let path = self.path();
+        path.file_stem()
+            .or_else(|| path.file_name())
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .unwrap_or("dia_slice")
+            .to_string()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct DiaCapabilities {
+    pub(crate) has_mobility: bool,
+    pub(crate) has_isolation_window: bool,
+    pub(crate) requires_vendor_runtime: bool,
+}
+
+impl DiaCapabilities {
+    fn labels(self) -> String {
+        let mut labels = vec!["rt", "mz"];
+        if self.has_mobility {
+            labels.push("mobility");
+        }
+        if self.has_isolation_window {
+            labels.push("quad-window");
+        }
+        if self.requires_vendor_runtime {
+            labels.push("vendor-runtime");
+        }
+        labels.join(", ")
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DiaSliceRequest {
+    pub(crate) mz: f64,
+    pub(crate) mz_ppm: f64,
+    pub(crate) mz_da: Option<f64>,
+    pub(crate) peptide_target: Option<DiaPeptideTarget>,
+    pub(crate) rt_min: Option<f64>,
+    pub(crate) rt_max: Option<f64>,
+    pub(crate) im_min: Option<f64>,
+    pub(crate) im_max: Option<f64>,
+    pub(crate) quad_min: Option<f64>,
+    pub(crate) quad_max: Option<f64>,
+}
+
+impl DiaSliceRequest {
+    fn mz_bounds(&self) -> (f64, f64) {
+        let delta = self
+            .mz_da
+            .unwrap_or_else(|| self.mz * self.mz_ppm / 1_000_000.0);
+        (self.mz - delta, self.mz + delta)
+    }
+
+    fn rt_window_label(&self) -> String {
+        match (self.rt_min, self.rt_max) {
+            (Some(lo), Some(hi)) => format!("{lo:.3}-{hi:.3} min"),
+            _ => "all RT".to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DiaPeptideTarget {
+    pub(crate) input: String,
+    pub(crate) sequence: String,
+    pub(crate) modified_sequence: String,
+    pub(crate) charge: i32,
+    pub(crate) precursor_mz: f64,
+    pub(crate) fragment: Option<DiaFragmentTarget>,
+    pub(crate) fragments: Vec<DiaFragmentTarget>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DiaFragmentTarget {
+    pub(crate) input: String,
+    pub(crate) label: String,
+    pub(crate) series: String,
+    pub(crate) charge: u8,
+    pub(crate) mz: f64,
+}
+
+#[derive(Clone, Debug)]
+struct DiaSliceOptions {
+    input: Option<DiaInput>,
+    bruker_so: Option<PathBuf>,
+    python_bin: Option<PathBuf>,
+    bruker_backend: BrukerBackend,
+    request: Option<DiaSliceRequest>,
+    out_prefix: Option<PathBuf>,
+    outdir: Option<PathBuf>,
+    mz_profile_bins: usize,
+    peptide_input: Option<String>,
+    fragment_input: Option<String>,
+    mod_inputs: Vec<String>,
+    charge_override: Option<i32>,
+    pseudo_ms2: bool,
+    pseudo_ms2_rt_window_min: f64,
+    verbosity: Verbosity,
+}
+
+impl Default for DiaSliceOptions {
+    fn default() -> Self {
+        Self {
+            input: None,
+            bruker_so: None,
+            python_bin: None,
+            bruker_backend: BrukerBackend::Auto,
+            request: None,
+            out_prefix: None,
+            outdir: None,
+            mz_profile_bins: DEFAULT_MZ_PROFILE_BINS,
+            peptide_input: None,
+            fragment_input: None,
+            mod_inputs: Vec::new(),
+            charge_override: None,
+            pseudo_ms2: false,
+            pseudo_ms2_rt_window_min: DEFAULT_PSEUDO_MS2_RT_WINDOW_MIN,
+            verbosity: Verbosity::Normal,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Verbosity {
+    Quiet,
+    Normal,
+    Verbose,
+}
+
+impl Verbosity {
+    fn status(self, args: std::fmt::Arguments<'_>) {
+        if self != Self::Quiet {
+            eprintln!("{args}");
+        }
+    }
+
+    fn detail(self, args: std::fmt::Arguments<'_>) {
+        if self == Self::Verbose {
+            eprintln!("{args}");
+        }
+    }
+
+    fn success(self, args: std::fmt::Arguments<'_>) {
+        if self != Self::Quiet {
+            println!("{args}");
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PseudoMs2Options {
+    enabled: bool,
+    rt_window_min: f64,
+}
+
+#[derive(Clone, Debug)]
+struct PseudoMs2Report {
+    input_path: PathBuf,
+    out_prefix: PathBuf,
+    peptide: DiaPeptideTarget,
+    rt_window: PseudoMs2RtWindow,
+    frames_considered: usize,
+    frames_with_signal: usize,
+    matched_events: usize,
+    precursor_frames_with_signal: usize,
+    precursor_apex_rt: Option<f64>,
+    precursor_apex_intensity: f64,
+    fragments: Vec<PseudoMs2FragmentEvidence>,
+}
+
+#[derive(Clone, Debug)]
+struct PseudoMs2RtWindow {
+    min: f64,
+    max: f64,
+    source: &'static str,
+}
+
+impl PseudoMs2RtWindow {
+    fn label(&self) -> String {
+        format!("{:.3}-{:.3} min ({})", self.min, self.max, self.source)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PseudoMs2FragmentEvidence {
+    label: String,
+    series: String,
+    charge: u8,
+    mz: f64,
+    summed_intensity: f64,
+    matched_events: usize,
+    frames_with_signal: usize,
+    apex_rt: Option<f64>,
+    apex_intensity: f64,
+}
+
+#[derive(Clone, Debug)]
+struct RtProfileRow {
+    scan_index: u32,
+    scan_id: String,
+    rt_minutes: Option<f64>,
+    summed_intensity: f64,
+    matched_peaks: usize,
+    precursor_mz: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MzProfileBin {
+    mz_center: f64,
+    summed_intensity: f64,
+}
+
+#[derive(Clone, Debug)]
+struct DiaSliceSummary {
+    backend_label: &'static str,
+    input_path: PathBuf,
+    out_prefix: PathBuf,
+    mz_min: f64,
+    mz_max: f64,
+    spectra_considered: usize,
+    spectra_with_signal: usize,
+    matched_peaks: usize,
+    capabilities: DiaCapabilities,
+    acquisition_mode: Option<String>,
+    intensity_column: Option<String>,
+    vendor_runtime_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+struct BrukerRuntime {
+    path: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BrukerBackend {
+    Auto,
+    Native,
+    AlphaTims,
+}
+
+impl BrukerBackend {
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "native" | "timsrust" => Ok(Self::Native),
+            "alphatims" | "python" => Ok(Self::AlphaTims),
+            other => anyhow::bail!(
+                "unknown --bruker-backend `{other}`; expected auto, native, or alphatims"
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MobilityProfileRow {
+    mobility: f64,
+    summed_intensity: f64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct BrukerBridgePayload {
+    acquisition_mode: String,
+    intensity_column: String,
+    mz_min: f64,
+    mz_max: f64,
+    frames_considered: usize,
+    frames_with_signal: usize,
+    matched_events: usize,
+    rt_profile: Vec<BrukerBridgeRtRow>,
+    mz_profile: Vec<BrukerBridgeMzRow>,
+    im_profile: Vec<BrukerBridgeImRow>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct BrukerBridgeRtRow {
+    frame_index: u32,
+    rt_minutes: f64,
+    summed_intensity: f64,
+    matched_events: usize,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct BrukerBridgeMzRow {
+    mz_center: f64,
+    summed_intensity: f64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct BrukerBridgeImRow {
+    mobility: f64,
+    summed_intensity: f64,
+}
+
+pub fn run(args: Vec<String>) -> anyhow::Result<()> {
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "-h" | "--help" | "help"))
+    {
+        print_help();
+        return Ok(());
+    }
+
+    let options = parse_args(args)?;
+    let input = options
+        .input
+        .as_ref()
+        .expect("parse_args validates DIA input");
+    let request = options
+        .request
+        .as_ref()
+        .expect("parse_args validates DIA request");
+    let default_prefix = default_out_prefix(input, request);
+    let file_prefix = options.out_prefix.clone().unwrap_or(default_prefix);
+    let out_prefix = options
+        .outdir
+        .as_ref()
+        .map(|outdir| outdir.join(&file_prefix))
+        .unwrap_or(file_prefix);
+    options.verbosity.status(format_args!(
+        "DIA slice: input={} target={} output-prefix={}",
+        compact_display_path(input.path(), 72),
+        request_target_label(request),
+        out_prefix.display()
+    ));
+    options.verbosity.detail(format_args!(
+        "DIA slice: m/z {:.6}-{:.6}, RT {}, IM {:?}-{:?}, quad {:?}-{:?}",
+        request.mz_bounds().0,
+        request.mz_bounds().1,
+        request.rt_window_label(),
+        request.im_min,
+        request.im_max,
+        request.quad_min,
+        request.quad_max,
+    ));
+
+    match input {
+        DiaInput::Mzml(path) => run_mzml_slice(
+            path,
+            request,
+            &out_prefix,
+            options.mz_profile_bins,
+            &PseudoMs2Options {
+                enabled: options.pseudo_ms2,
+                rt_window_min: options.pseudo_ms2_rt_window_min,
+            },
+            options.verbosity,
+            DiaCapabilities {
+                has_mobility: false,
+                has_isolation_window: false,
+                requires_vendor_runtime: false,
+            },
+        ),
+        DiaInput::Bruker(path) => run_bruker_slice(
+            path,
+            request,
+            options.bruker_so.as_deref(),
+            options.python_bin.as_deref(),
+            options.bruker_backend,
+            options.mz_profile_bins,
+            &PseudoMs2Options {
+                enabled: options.pseudo_ms2,
+                rt_window_min: options.pseudo_ms2_rt_window_min,
+            },
+            options.verbosity,
+            &out_prefix,
+        ),
+    }
+}
+
+fn print_help() {
+    let program = crate::program_name();
+    println!("{program} dia-slice");
+    println!();
+    println!("USAGE:");
+    println!(
+        "  {program} dia-slice (--mzml <file> | --bruker <run.d>) (--mz <center> | --peptide <SEQ>) [options]"
+    );
+    println!();
+    println!("OPTIONS:");
+    println!("  --mzml <file>            Input DIA mzML file");
+    println!("  --bruker <run.d>         Input Bruker .d folder");
+    println!("  --bruker-so <path>       Override timsdata.so location for Bruker .d input");
+    println!("  --bruker-backend <name>  Bruker backend: auto, native, alphatims [auto]");
+    println!("  --python <exe>           Python interpreter for the alphaTims Bruker bridge");
+    println!("  --mz <center>            Target fragment/signal m/z center");
+    println!("  --peptide <SEQ>          Peptide precursor target; supports inline mods and /charge suffix");
+    println!("  --sequence <SEQ>         Alias for --peptide");
+    println!("  --sequence-modi <SEQ>    Alias for --peptide");
+    println!("  --sequencemodi <SEQ>     Alias for --peptide");
+    println!(
+        "  --fragment <ion>         Peptide fragment target, e.g. b8, y8, b8++ [default: precursor]"
+    );
+    println!(
+        "  --pseudo-ms2             Write aggregated DIA fragment evidence as pseudo-MS2 TSV/SVG"
+    );
+    println!("  --ms2                    Alias for --pseudo-ms2");
+    println!(
+        "  --pseudo-ms2-rt-window <min>  Inferred RT window width [{}]",
+        DEFAULT_PSEUDO_MS2_RT_WINDOW_MIN
+    );
+    println!("  --mod <pos:delta>        Peptide mass shift, repeatable; requires --peptide");
+    println!(
+        "  --charge <int>           Peptide precursor charge override [default: peptide /charge or {}]",
+        DEFAULT_PEPTIDE_CHARGE
+    );
+    println!(
+        "  --mz-ppm <ppm>           m/z extraction tolerance in ppm [{}]",
+        DEFAULT_MZ_PPM
+    );
+    println!("  --mz-da <da>             Absolute m/z tolerance in Th; overrides --mz-ppm [default: none]");
+    println!("  --rt-min <min>           RT lower bound in minutes [default: none; all RT]");
+    println!("  --rt-max <max>           RT upper bound in minutes [default: none; all RT]");
+    println!("  --im-min <1/K0>          Ion mobility lower bound [default: none; all mobility]");
+    println!("  --im-max <1/K0>          Ion mobility upper bound [default: none; all mobility]");
+    println!(
+        "  --quad-min <mz>          Quadrupole isolation lower bound [default: none; all windows]"
+    );
+    println!(
+        "  --quad-max <mz>          Quadrupole isolation upper bound [default: none; all windows]"
+    );
+    println!("  --out-prefix <name>      Output file stem/name only; no directories");
+    println!("  --outdir <dir>           Output directory using the default generated file prefix");
+    println!(
+        "  --mz-bins <n>            Number of bins for the m/z profile [{}]",
+        DEFAULT_MZ_PROFILE_BINS
+    );
+    println!("  -v, --verbose            Print detailed progress/status messages");
+    println!("  -q, --quiet              Suppress non-error terminal output");
+    println!("  --help                   Show this help");
+    println!();
+    println!("OUTPUTS:");
+    println!("  <prefix>.summary.txt");
+    println!("  <prefix>.rt_profile.tsv");
+    println!("  <prefix>.mz_profile.tsv");
+    println!("  <prefix>.im_profile.tsv  Mobility-capable backends only");
+    println!("  <prefix>.svg");
+    println!();
+    println!("NOTES:");
+    println!(
+        "  Native Bruker .d support uses timsrust. The alphaTims fallback requires timsdata.so and checks {}",
+        DEFAULT_BRUKER_SO_PATHS.join(", ")
+    );
+    println!("  Use --bruker-so or {BRUKER_SO_ENV_VAR} to override the default runtime path");
+}
+
+fn parse_args(args: Vec<String>) -> anyhow::Result<DiaSliceOptions> {
+    let mut options = DiaSliceOptions::default();
+    let mut mz = None::<f64>;
+    let mut mz_ppm = DEFAULT_MZ_PPM;
+    let mut mz_da = None::<f64>;
+    let mut rt_min = None::<f64>;
+    let mut rt_max = None::<f64>;
+    let mut im_min = None::<f64>;
+    let mut im_max = None::<f64>;
+    let mut quad_min = None::<f64>;
+    let mut quad_max = None::<f64>;
+
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--mzml" => {
+                let path = PathBuf::from(iter.next().context("--mzml expects a path")?);
+                set_input(&mut options.input, DiaInput::Mzml(path), "--mzml")?;
+            }
+            "--bruker" => {
+                let path = PathBuf::from(iter.next().context("--bruker expects a path")?);
+                set_input(&mut options.input, DiaInput::Bruker(path), "--bruker")?;
+            }
+            "--bruker-so" => {
+                options.bruker_so = Some(PathBuf::from(
+                    iter.next().context("--bruker-so expects a path")?,
+                ));
+            }
+            "--bruker-backend" => {
+                let raw = iter.next().context("--bruker-backend expects a name")?;
+                options.bruker_backend = BrukerBackend::parse(&raw)?;
+            }
+            "--python" => {
+                options.python_bin = Some(PathBuf::from(
+                    iter.next()
+                        .context("--python expects a path or executable name")?,
+                ));
+            }
+            "--mz" => {
+                mz = Some(parse_f64_flag("--mz", iter.next())?);
+            }
+            "--peptide" | "--sequence" | "--sequence-modi" | "--sequencemodi" => {
+                let peptide = iter
+                    .next()
+                    .with_context(|| format!("{arg} expects a peptide sequence"))?;
+                set_peptide_input(&mut options, peptide)?;
+            }
+            "--fragment" => {
+                let fragment = iter
+                    .next()
+                    .context("--fragment expects a fragment ion label")?;
+                set_fragment_input(&mut options, fragment)?;
+            }
+            "--pseudo-ms2" | "--ms2" => {
+                options.pseudo_ms2 = true;
+            }
+            "--pseudo-ms2-rt-window" => {
+                options.pseudo_ms2_rt_window_min =
+                    parse_f64_flag("--pseudo-ms2-rt-window", iter.next())?;
+            }
+            "--mod" => {
+                options
+                    .mod_inputs
+                    .push(iter.next().context("--mod expects <position>:<delta>")?);
+            }
+            "--charge" => {
+                let raw = iter.next().context("--charge expects an integer")?;
+                let charge = raw.parse::<i32>().context("invalid --charge")?;
+                if charge <= 0 {
+                    anyhow::bail!("--charge must be a positive integer");
+                }
+                options.charge_override = Some(charge);
+            }
+            "--mz-ppm" => {
+                mz_ppm = parse_f64_flag("--mz-ppm", iter.next())?;
+            }
+            "--mz-da" => {
+                mz_da = Some(parse_f64_flag("--mz-da", iter.next())?);
+            }
+            "--rt-min" => {
+                rt_min = Some(parse_f64_flag("--rt-min", iter.next())?);
+            }
+            "--rt-max" => {
+                rt_max = Some(parse_f64_flag("--rt-max", iter.next())?);
+            }
+            "--im-min" => {
+                im_min = Some(parse_f64_flag("--im-min", iter.next())?);
+            }
+            "--im-max" => {
+                im_max = Some(parse_f64_flag("--im-max", iter.next())?);
+            }
+            "--quad-min" => {
+                quad_min = Some(parse_f64_flag("--quad-min", iter.next())?);
+            }
+            "--quad-max" => {
+                quad_max = Some(parse_f64_flag("--quad-max", iter.next())?);
+            }
+            "--out-prefix" => {
+                let raw = iter.next().context("--out-prefix expects a name")?;
+                options.out_prefix = Some(parse_out_prefix(&raw)?);
+            }
+            "--outdir" => {
+                options.outdir = Some(PathBuf::from(
+                    iter.next().context("--outdir expects a path")?,
+                ));
+            }
+            "--mz-bins" => {
+                let raw = iter.next().context("--mz-bins expects an integer")?;
+                let bins = raw.parse::<usize>().context("invalid --mz-bins")?;
+                if bins == 0 {
+                    anyhow::bail!("--mz-bins must be at least 1");
+                }
+                options.mz_profile_bins = bins;
+            }
+            "-v" | "--verbose" => {
+                options.verbosity = Verbosity::Verbose;
+            }
+            "-q" | "--quiet" => {
+                options.verbosity = Verbosity::Quiet;
+            }
+            other => anyhow::bail!("unknown dia-slice option `{other}`"),
+        }
+    }
+
+    if mz_ppm <= 0.0 || !mz_ppm.is_finite() {
+        anyhow::bail!("--mz-ppm must be a positive finite number");
+    }
+    if let Some(value) = mz_da {
+        if value <= 0.0 || !value.is_finite() {
+            anyhow::bail!("--mz-da must be a positive finite number");
+        }
+    }
+    if options.pseudo_ms2_rt_window_min <= 0.0 || !options.pseudo_ms2_rt_window_min.is_finite() {
+        anyhow::bail!("--pseudo-ms2-rt-window must be a positive finite number");
+    }
+    let input = options.input.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("dia-slice requires exactly one of --mzml <file> or --bruker <run.d>")
+    })?;
+    if options.peptide_input.is_none() && !options.mod_inputs.is_empty() {
+        anyhow::bail!("--mod requires --peptide (or a sequence alias)");
+    }
+    if options.peptide_input.is_none() && options.charge_override.is_some() {
+        anyhow::bail!("--charge requires --peptide (or a sequence alias)");
+    }
+    if options.peptide_input.is_none() && options.fragment_input.is_some() {
+        anyhow::bail!("--fragment requires --peptide (or a sequence alias)");
+    }
+    if options.peptide_input.is_none() && options.pseudo_ms2 {
+        anyhow::bail!("--pseudo-ms2 requires --peptide (or a sequence alias)");
+    }
+    if options.pseudo_ms2 && options.fragment_input.is_some() {
+        anyhow::bail!("--pseudo-ms2 aggregates all peptide fragments; omit --fragment");
+    }
+    let peptide_target = options
+        .peptide_input
+        .as_deref()
+        .map(|peptide| {
+            resolve_peptide_target(
+                peptide,
+                options.fragment_input.as_deref(),
+                &options.mod_inputs,
+                options.charge_override,
+            )
+        })
+        .transpose()?;
+    let mz = match (mz, peptide_target.as_ref()) {
+        (Some(_), Some(_)) => {
+            anyhow::bail!("specify only one of --mz <center> or --peptide <SEQ>")
+        }
+        (Some(value), None) => value,
+        (None, Some(target)) => target
+            .fragment
+            .as_ref()
+            .map(|fragment| fragment.mz)
+            .unwrap_or(target.precursor_mz),
+        (None, None) => {
+            anyhow::bail!("dia-slice requires --mz <center> or --peptide <SEQ>")
+        }
+    };
+    if !mz.is_finite() {
+        anyhow::bail!("--mz must be finite");
+    }
+
+    validate_bounds(rt_min, rt_max, "RT")?;
+    validate_bounds(im_min, im_max, "ion mobility")?;
+    validate_bounds(quad_min, quad_max, "quadrupole")?;
+
+    if matches!(input, DiaInput::Mzml(_)) && (im_min.is_some() || quad_min.is_some()) {
+        anyhow::bail!(
+            "--mzml input does not support --im-* or --quad-* yet; those filters are reserved for backends with mobility/isolation-window dimensions"
+        );
+    }
+    if options.bruker_so.is_some() && !matches!(input, DiaInput::Bruker(_)) {
+        anyhow::bail!("--bruker-so is only valid together with --bruker <run.d>");
+    }
+    if options.python_bin.is_some() && !matches!(input, DiaInput::Bruker(_)) {
+        anyhow::bail!("--python is only valid together with --bruker <run.d>");
+    }
+    if options.pseudo_ms2 && matches!(input, DiaInput::Mzml(_)) {
+        anyhow::bail!("--pseudo-ms2 currently supports native Bruker .d input only");
+    }
+    if options.pseudo_ms2 && options.bruker_backend == BrukerBackend::AlphaTims {
+        anyhow::bail!("--pseudo-ms2 currently requires --bruker-backend native or auto");
+    }
+
+    options.request = Some(DiaSliceRequest {
+        mz,
+        mz_ppm,
+        mz_da,
+        peptide_target,
+        rt_min,
+        rt_max,
+        im_min,
+        im_max,
+        quad_min,
+        quad_max,
+    });
+    Ok(options)
+}
+
+fn set_peptide_input(options: &mut DiaSliceOptions, peptide: String) -> anyhow::Result<()> {
+    if options.peptide_input.is_some() {
+        anyhow::bail!("specify peptide input only once");
+    }
+    options.peptide_input = Some(peptide);
+    Ok(())
+}
+
+fn set_fragment_input(options: &mut DiaSliceOptions, fragment: String) -> anyhow::Result<()> {
+    if options.fragment_input.is_some() {
+        anyhow::bail!("specify fragment input only once");
+    }
+    options.fragment_input = Some(fragment);
+    Ok(())
+}
+
+fn resolve_peptide_target(
+    peptide_input: &str,
+    fragment_input: Option<&str>,
+    mod_inputs: &[String],
+    charge_override: Option<i32>,
+) -> anyhow::Result<DiaPeptideTarget> {
+    let context = prepare_annotation(
+        peptide_input,
+        mod_inputs,
+        &[],
+        charge_override,
+        MassTolerance::Ppm(DEFAULT_MZ_PPM),
+    )?;
+    let charge = context.charge_context.unwrap_or(DEFAULT_PEPTIDE_CHARGE);
+    if charge <= 0 {
+        anyhow::bail!("peptide target charge must be positive");
+    }
+    let precursor_mz = context
+        .peptide
+        .precursor_mz(charge)
+        .ok_or_else(|| anyhow::anyhow!("failed to compute peptide precursor m/z"))?;
+    let charges = fragment_charge_states(Some(charge));
+    let fragments = generate_fragments(&context.peptide, &charges, &[])
+        .into_iter()
+        .map(dia_fragment_target)
+        .collect::<Vec<_>>();
+    let fragment = fragment_input
+        .map(|fragment| resolve_fragment_target(fragment, &fragments, context.peptide.sequence()))
+        .transpose()?;
+    Ok(DiaPeptideTarget {
+        input: peptide_input.to_string(),
+        sequence: context.peptide.sequence().to_string(),
+        modified_sequence: context.modified_sequence(),
+        charge,
+        precursor_mz,
+        fragment,
+        fragments,
+    })
+}
+
+fn resolve_fragment_target(
+    fragment_input: &str,
+    fragments: &[DiaFragmentTarget],
+    peptide_sequence: &str,
+) -> anyhow::Result<DiaFragmentTarget> {
+    let requested = fragment_input.trim();
+    if requested.is_empty() {
+        anyhow::bail!("--fragment cannot be empty");
+    }
+    let matches = fragments
+        .iter()
+        .filter(|fragment| fragment_label_matches(fragment, requested))
+        .collect::<Vec<_>>();
+
+    match matches.as_slice() {
+        [fragment] => {
+            let mut out = (*fragment).clone();
+            out.input = requested.to_string();
+            Ok(out)
+        }
+        [] => {
+            let available = fragments
+                .iter()
+                .map(|fragment| fragment.label.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "unknown --fragment `{requested}` for peptide {}; available fragments: {}",
+                peptide_sequence,
+                available
+            )
+        }
+        _ => anyhow::bail!("ambiguous --fragment `{requested}`"),
+    }
+}
+
+fn dia_fragment_target(fragment: FragmentIon) -> DiaFragmentTarget {
+    let label = fragment.label();
+    DiaFragmentTarget {
+        input: label.clone(),
+        label,
+        series: fragment_series_label(fragment.series).to_string(),
+        charge: fragment.charge,
+        mz: fragment.theoretical_mz,
+    }
+}
+
+fn fragment_series_label(series: FragmentSeries) -> &'static str {
+    match series {
+        FragmentSeries::B => "b",
+        FragmentSeries::Y => "y",
+    }
+}
+
+fn fragment_label_matches(fragment: &DiaFragmentTarget, requested: &str) -> bool {
+    if fragment.label.eq_ignore_ascii_case(requested) {
+        return true;
+    }
+    if fragment.charge == 1 && requested.ends_with('+') {
+        let trimmed = requested.trim_end_matches('+');
+        return fragment.label.eq_ignore_ascii_case(trimmed);
+    }
+    false
+}
+
+fn set_input(slot: &mut Option<DiaInput>, value: DiaInput, flag: &str) -> anyhow::Result<()> {
+    if slot.is_some() {
+        anyhow::bail!("dia-slice accepts only one input source; `{flag}` conflicts with the earlier input flag");
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+fn parse_f64_flag(flag: &str, value: Option<String>) -> anyhow::Result<f64> {
+    let raw = value.with_context(|| format!("{flag} expects a value"))?;
+    raw.parse::<f64>()
+        .with_context(|| format!("invalid {flag} value `{raw}`"))
+}
+
+fn parse_out_prefix(raw: &str) -> anyhow::Result<PathBuf> {
+    let path = Path::new(raw);
+    let has_one_normal_component = path.components().count() == 1 && path.file_name().is_some();
+    if raw.ends_with('/') || raw.ends_with('\\') || !has_one_normal_component {
+        anyhow::bail!(
+            "--out-prefix expects a file stem/name, not a path; use --outdir for output directories"
+        );
+    }
+    Ok(PathBuf::from(raw))
+}
+
+fn validate_bounds(min: Option<f64>, max: Option<f64>, label: &str) -> anyhow::Result<()> {
+    if min.is_some() != max.is_some() {
+        anyhow::bail!("{label} bounds must specify both min and max");
+    }
+    if let (Some(lo), Some(hi)) = (min, max) {
+        if !lo.is_finite() || !hi.is_finite() {
+            anyhow::bail!("{label} bounds must be finite");
+        }
+        if lo >= hi {
+            anyhow::bail!("{label} min must be smaller than max");
+        }
+    }
+    Ok(())
+}
+
+fn default_out_prefix(input: &DiaInput, request: &DiaSliceRequest) -> PathBuf {
+    let target = request
+        .peptide_target
+        .as_ref()
+        .map(|target| {
+            let fragment = target
+                .fragment
+                .as_ref()
+                .map(|fragment| format!("_{}", sanitize_filename_component(&fragment.label)))
+                .unwrap_or_default();
+            format!(
+                "{}_z{}{}",
+                sanitize_filename_component(&target.sequence),
+                target.charge,
+                fragment
+            )
+        })
+        .unwrap_or_else(|| format!("mz_{:.4}", request.mz));
+    PathBuf::from(format!("{}.dia_slice_{}", input.default_stem(), target))
+}
+
+fn request_target_label(request: &DiaSliceRequest) -> String {
+    request
+        .peptide_target
+        .as_ref()
+        .map(|target| match target.fragment.as_ref() {
+            Some(fragment) => format!(
+                "{}/{} fragment {} m/z {:.4}",
+                target.modified_sequence, target.charge, fragment.label, fragment.mz
+            ),
+            None => format!(
+                "{}/{} precursor m/z {:.4}",
+                target.modified_sequence, target.charge, target.precursor_mz
+            ),
+        })
+        .unwrap_or_else(|| format!("m/z {:.4}", request.mz))
+}
+
+fn run_mzml_slice(
+    path: &Path,
+    request: &DiaSliceRequest,
+    out_prefix: &Path,
+    mz_profile_bins: usize,
+    pseudo_ms2: &PseudoMs2Options,
+    verbosity: Verbosity,
+    capabilities: DiaCapabilities,
+) -> anyhow::Result<()> {
+    if pseudo_ms2.enabled {
+        anyhow::bail!("--pseudo-ms2 currently supports native Bruker .d input only");
+    }
+    if !path.is_file() {
+        anyhow::bail!("mzML input does not exist: {}", path.display());
+    }
+
+    let (mz_min, mz_max) = request.mz_bounds();
+    verbosity.status(format_args!(
+        "DIA slice: reading mzML and extracting MS2 signal in m/z {:.6}-{:.6}",
+        mz_min, mz_max
+    ));
+    let mut reader = open_reader(path)?;
+    let total = reader.len();
+    verbosity.detail(format_args!("DIA slice: mzML spectrum count={total}"));
+    let mut rt_rows = Vec::<RtProfileRow>::new();
+    let mut mz_bins = vec![
+        MzProfileBin {
+            mz_center: 0.0,
+            summed_intensity: 0.0,
+        };
+        mz_profile_bins
+    ];
+    initialize_mz_bins(&mut mz_bins, mz_min, mz_max);
+
+    let mut spectra_considered = 0usize;
+    let mut spectra_with_signal = 0usize;
+    let mut matched_peaks = 0usize;
+
+    for idx in 0..total {
+        let spectrum = load_spectrum_by_index(&mut reader, idx as u32)?;
+        if spectrum.meta.ms_level != 2 {
+            continue;
+        }
+
+        let rt = spectrum.meta.rt_minutes.map(f64::from);
+        if !rt_in_window(rt, request.rt_min, request.rt_max) {
+            continue;
+        }
+
+        spectra_considered += 1;
+        let mut sum_intensity = 0.0f64;
+        let mut peaks_in_window = 0usize;
+        for (&mz, &intensity) in spectrum.mz.iter().zip(spectrum.intensity.iter()) {
+            if mz < mz_min || mz > mz_max {
+                continue;
+            }
+            let intensity = intensity as f64;
+            sum_intensity += intensity;
+            peaks_in_window += 1;
+            accumulate_mz_bin(&mut mz_bins, mz_min, mz_max, mz, intensity);
+        }
+
+        if peaks_in_window > 0 {
+            spectra_with_signal += 1;
+            matched_peaks += peaks_in_window;
+        }
+
+        rt_rows.push(RtProfileRow {
+            scan_index: spectrum.meta.idx,
+            scan_id: spectrum.meta.scan_id,
+            rt_minutes: rt,
+            summed_intensity: sum_intensity,
+            matched_peaks: peaks_in_window,
+            precursor_mz: spectrum.meta.precursor_mz,
+        });
+    }
+
+    if rt_rows.is_empty() {
+        anyhow::bail!(
+            "no MS2 spectra matched the requested mzML DIA slice window (mz {:.4}-{:.4}, RT {})",
+            mz_min,
+            mz_max,
+            request.rt_window_label(),
+        );
+    }
+
+    let summary = DiaSliceSummary {
+        backend_label: "mzML",
+        input_path: path.to_path_buf(),
+        out_prefix: out_prefix.to_path_buf(),
+        mz_min,
+        mz_max,
+        spectra_considered,
+        spectra_with_signal,
+        matched_peaks,
+        capabilities,
+        acquisition_mode: None,
+        intensity_column: None,
+        vendor_runtime_path: None,
+    };
+    write_outputs(&summary, request, &rt_rows, &mz_bins, None)?;
+
+    verbosity.success(format_args!(
+        "Wrote DIA slice outputs: {} ({} spectra considered, {} with signal, {} matched peaks)",
+        out_prefix.display(),
+        summary.spectra_considered,
+        summary.spectra_with_signal,
+        summary.matched_peaks,
+    ));
+    Ok(())
+}
+
+fn run_bruker_slice(
+    path: &Path,
+    request: &DiaSliceRequest,
+    bruker_so_override: Option<&Path>,
+    python_override: Option<&Path>,
+    backend: BrukerBackend,
+    mz_profile_bins: usize,
+    pseudo_ms2: &PseudoMs2Options,
+    verbosity: Verbosity,
+    out_prefix: &Path,
+) -> anyhow::Result<()> {
+    if !path.is_dir() {
+        anyhow::bail!(
+            "Bruker input does not exist or is not a directory: {}",
+            path.display()
+        );
+    }
+
+    match backend {
+        BrukerBackend::Native => run_bruker_slice_timsrust(
+            path,
+            request,
+            mz_profile_bins,
+            pseudo_ms2,
+            verbosity,
+            out_prefix,
+        ),
+        BrukerBackend::AlphaTims => run_bruker_slice_alphatims(
+            path,
+            request,
+            bruker_so_override,
+            python_override,
+            mz_profile_bins,
+            verbosity,
+            out_prefix,
+        ),
+        BrukerBackend::Auto => {
+            match run_bruker_slice_timsrust(
+                path,
+                request,
+                mz_profile_bins,
+                pseudo_ms2,
+                verbosity,
+                out_prefix,
+            ) {
+                Ok(()) => Ok(()),
+                Err(native_err) => {
+                    if pseudo_ms2.enabled {
+                        return Err(native_err)
+                            .context("--pseudo-ms2 requires the native timsrust Bruker backend");
+                    }
+                    verbosity.status(format_args!(
+                        "Native timsrust Bruker backend failed; falling back to alphaTims bridge ({native_err:#})"
+                    ));
+                    run_bruker_slice_alphatims(
+                        path,
+                        request,
+                        bruker_so_override,
+                        python_override,
+                        mz_profile_bins,
+                        verbosity,
+                        out_prefix,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "native timsrust backend failed first ({native_err:#}); alphaTims fallback also failed"
+                        )
+                    })
+                }
+            }
+        }
+    }
+}
+
+fn run_bruker_slice_timsrust(
+    path: &Path,
+    request: &DiaSliceRequest,
+    mz_profile_bins: usize,
+    pseudo_ms2: &PseudoMs2Options,
+    verbosity: Verbosity,
+    out_prefix: &Path,
+) -> anyhow::Result<()> {
+    let (mz_min, mz_max) = request.mz_bounds();
+    verbosity.status(format_args!(
+        "DIA slice: reading Bruker .d with timsrust and extracting m/z {:.6}-{:.6}",
+        mz_min, mz_max
+    ));
+    let payload = build_timsrust_bruker_payload(path, request, mz_profile_bins)?;
+    verbosity.detail(format_args!(
+        "DIA slice: native extraction yielded {} frames with signal from {} considered frames",
+        payload.frames_with_signal, payload.frames_considered
+    ));
+    let precursor_rt_points = payload
+        .rt_profile
+        .iter()
+        .map(|row| (row.rt_minutes, row.summed_intensity))
+        .collect::<Vec<_>>();
+    let has_isolation_window = payload.acquisition_mode == "diaPASEF";
+    let summary = finish_bruker_slice_outputs(
+        path,
+        request,
+        out_prefix,
+        "Bruker .d (timsrust native)",
+        has_isolation_window,
+        false,
+        None,
+        payload,
+    )?;
+    if pseudo_ms2.enabled {
+        verbosity.status(format_args!(
+            "Pseudo-MS2: inferring RT window from the extracted precursor trace"
+        ));
+        let report = build_timsrust_pseudo_ms2(
+            path,
+            request,
+            out_prefix,
+            pseudo_ms2,
+            &precursor_rt_points,
+            verbosity,
+        )?;
+        write_pseudo_ms2_outputs(&report)?;
+        verbosity.success(format_args!(
+            "Wrote pseudo-MS2 outputs: {} ({} frames considered, {} with signal, {} matched detector events)",
+            out_prefix.display(),
+            report.frames_considered,
+            report.frames_with_signal,
+            report.matched_events,
+        ));
+    }
+    print_bruker_success(out_prefix, &summary, verbosity);
+    Ok(())
+}
+
+fn run_bruker_slice_alphatims(
+    path: &Path,
+    request: &DiaSliceRequest,
+    bruker_so_override: Option<&Path>,
+    python_override: Option<&Path>,
+    mz_profile_bins: usize,
+    verbosity: Verbosity,
+    out_prefix: &Path,
+) -> anyhow::Result<()> {
+    let runtime = resolve_bruker_runtime(bruker_so_override)?;
+    let python = resolve_python(python_override)?;
+    let (mz_min, mz_max) = request.mz_bounds();
+    verbosity.status(format_args!(
+        "DIA slice: reading Bruker .d through alphaTims bridge and extracting m/z {:.6}-{:.6}",
+        mz_min, mz_max
+    ));
+    verbosity.detail(format_args!(
+        "DIA slice: alphaTims runtime={} python={}",
+        runtime.path.display(),
+        python.display()
+    ));
+    let payload = run_bruker_bridge(
+        path,
+        request,
+        runtime.path.as_path(),
+        python.as_path(),
+        mz_profile_bins,
+    )?;
+
+    let summary = finish_bruker_slice_outputs(
+        path,
+        request,
+        out_prefix,
+        "Bruker .d (alphaTims bridge)",
+        true,
+        true,
+        Some(runtime.path),
+        payload,
+    )?;
+    print_bruker_success(out_prefix, &summary, verbosity);
+    Ok(())
+}
+
+fn finish_bruker_slice_outputs(
+    path: &Path,
+    request: &DiaSliceRequest,
+    out_prefix: &Path,
+    backend_label: &'static str,
+    has_isolation_window: bool,
+    requires_vendor_runtime: bool,
+    vendor_runtime_path: Option<PathBuf>,
+    payload: BrukerBridgePayload,
+) -> anyhow::Result<DiaSliceSummary> {
+    if payload.matched_events == 0 {
+        anyhow::bail!(
+            "no detector events matched the requested Bruker slice window (mz {:.4}-{:.4}, RT {}, IM {:?}-{:?}, quad {:?}-{:?})",
+            payload.mz_min,
+            payload.mz_max,
+            request.rt_window_label(),
+            request.im_min,
+            request.im_max,
+            request.quad_min,
+            request.quad_max,
+        );
+    }
+
+    let rt_rows = payload
+        .rt_profile
+        .iter()
+        .map(|row| RtProfileRow {
+            scan_index: row.frame_index,
+            scan_id: format!("frame={}", row.frame_index),
+            rt_minutes: Some(row.rt_minutes),
+            summed_intensity: row.summed_intensity,
+            matched_peaks: row.matched_events,
+            precursor_mz: None,
+        })
+        .collect::<Vec<_>>();
+    let mz_bins = payload
+        .mz_profile
+        .iter()
+        .map(|row| MzProfileBin {
+            mz_center: row.mz_center,
+            summed_intensity: row.summed_intensity,
+        })
+        .collect::<Vec<_>>();
+    let im_rows = payload
+        .im_profile
+        .iter()
+        .map(|row| MobilityProfileRow {
+            mobility: row.mobility,
+            summed_intensity: row.summed_intensity,
+        })
+        .collect::<Vec<_>>();
+
+    let summary = DiaSliceSummary {
+        backend_label,
+        input_path: path.to_path_buf(),
+        out_prefix: out_prefix.to_path_buf(),
+        mz_min: payload.mz_min,
+        mz_max: payload.mz_max,
+        spectra_considered: payload.frames_considered,
+        spectra_with_signal: payload.frames_with_signal,
+        matched_peaks: payload.matched_events,
+        capabilities: DiaCapabilities {
+            has_mobility: true,
+            has_isolation_window,
+            requires_vendor_runtime,
+        },
+        acquisition_mode: Some(payload.acquisition_mode),
+        intensity_column: Some(payload.intensity_column),
+        vendor_runtime_path,
+    };
+    write_outputs(&summary, request, &rt_rows, &mz_bins, Some(&im_rows))?;
+    Ok(summary)
+}
+
+fn print_bruker_success(out_prefix: &Path, summary: &DiaSliceSummary, verbosity: Verbosity) {
+    verbosity.success(format_args!(
+        "Wrote DIA slice outputs: {} ({} frames considered, {} with signal, {} matched detector events)",
+        out_prefix.display(),
+        summary.spectra_considered,
+        summary.spectra_with_signal,
+        summary.matched_peaks,
+    ));
+}
+
+fn build_timsrust_bruker_payload(
+    path: &Path,
+    request: &DiaSliceRequest,
+    mz_profile_bins: usize,
+) -> anyhow::Result<BrukerBridgePayload> {
+    let metadata = MetadataReader::new(path)
+        .with_context(|| "failed to read Bruker metadata with timsrust")?;
+    let frame_reader =
+        FrameReader::new(path).with_context(|| "failed to open Bruker .d with timsrust")?;
+    let acquisition = frame_reader.get_acquisition();
+    if acquisition != AcquisitionType::DIAPASEF
+        && (request.quad_min.is_some() || request.quad_max.is_some())
+    {
+        anyhow::bail!(
+            "native timsrust Bruker backend supports --quad-* filters only for diaPASEF data"
+        );
+    }
+    let (mz_min, mz_max) = request.mz_bounds();
+    let tof_min = metadata.mz_converter.invert(mz_min).floor().max(0.0);
+    let tof_max = metadata.mz_converter.invert(mz_max).ceil().max(0.0);
+    if !tof_min.is_finite() || !tof_max.is_finite() || tof_min > tof_max {
+        anyhow::bail!("timsrust produced invalid TOF bounds for requested m/z slice");
+    }
+    let tof_min = tof_min as u32;
+    let tof_max = tof_max as u32;
+
+    let mut mz_bins = vec![
+        MzProfileBin {
+            mz_center: 0.0,
+            summed_intensity: 0.0,
+        };
+        mz_profile_bins
+    ];
+    initialize_mz_histogram_bins(&mut mz_bins, mz_min, mz_max);
+
+    let mut frames_considered = 0usize;
+    let mut frames_with_signal = 0usize;
+    let mut matched_events = 0usize;
+    let mut rt_profile = Vec::<BrukerBridgeRtRow>::new();
+    let mut im_accumulator = BTreeMap::<usize, (f64, f64)>::new();
+
+    for index in 0..frame_reader.len() {
+        let frame_meta = frame_reader
+            .get_frame_without_coordinates(index)
+            .with_context(|| format!("failed to inspect Bruker frame {}", index + 1))?;
+        if frame_meta.ms_level != MSLevel::MS2 {
+            continue;
+        }
+        if !rt_seconds_in_window(frame_meta.rt_in_seconds, request.rt_min, request.rt_max) {
+            continue;
+        }
+
+        frames_considered += 1;
+        let frame = frame_reader
+            .get(index)
+            .with_context(|| format!("failed to read Bruker frame {}", index + 1))?;
+        let mut frame_intensity = 0.0;
+        let mut frame_events = 0usize;
+
+        for scan_index in 0..frame.scan_offsets.len().saturating_sub(1) {
+            let mobility = metadata.im_converter.convert(scan_index as u32);
+            if !mobility_in_window(mobility, request.im_min, request.im_max) {
+                continue;
+            }
+            if !quad_in_window(&frame, scan_index, request.quad_min, request.quad_max) {
+                continue;
+            }
+
+            let start = frame.scan_offsets[scan_index];
+            let end = frame.scan_offsets[scan_index + 1];
+            if start >= end {
+                continue;
+            }
+            let scan_tofs = &frame.tof_indices[start..end];
+            let peak_start = scan_tofs.partition_point(|tof| *tof < tof_min);
+            let peak_end = scan_tofs.partition_point(|tof| *tof <= tof_max);
+
+            for relative_peak_index in peak_start..peak_end {
+                let peak_index = start + relative_peak_index;
+                let mz = metadata.mz_converter.convert(frame.tof_indices[peak_index]);
+                if mz < mz_min || mz > mz_max {
+                    continue;
+                }
+                let intensity = frame.get_corrected_intensity(peak_index);
+                if !intensity.is_finite() || intensity <= 0.0 {
+                    continue;
+                }
+                matched_events += 1;
+                frame_events += 1;
+                frame_intensity += intensity;
+                accumulate_mz_histogram_bin(&mut mz_bins, mz_min, mz_max, mz, intensity);
+                im_accumulator
+                    .entry(scan_index)
+                    .and_modify(|(_, summed_intensity)| *summed_intensity += intensity)
+                    .or_insert((mobility, intensity));
+            }
+        }
+
+        if frame_events > 0 {
+            frames_with_signal += 1;
+            rt_profile.push(BrukerBridgeRtRow {
+                frame_index: frame.index as u32,
+                rt_minutes: frame.rt_in_seconds / 60.0,
+                summed_intensity: frame_intensity,
+                matched_events: frame_events,
+            });
+        }
+    }
+
+    let acquisition_mode = timsrust_acquisition_label(acquisition).to_string();
+    let im_profile = im_accumulator
+        .into_iter()
+        .map(|(_, (mobility, summed_intensity))| BrukerBridgeImRow {
+            mobility,
+            summed_intensity,
+        })
+        .collect::<Vec<_>>();
+    let mz_profile = mz_bins
+        .into_iter()
+        .map(|bin| BrukerBridgeMzRow {
+            mz_center: bin.mz_center,
+            summed_intensity: bin.summed_intensity,
+        })
+        .collect::<Vec<_>>();
+
+    Ok(BrukerBridgePayload {
+        acquisition_mode,
+        intensity_column: "timsrust_corrected_intensity_values".to_string(),
+        mz_min,
+        mz_max,
+        frames_considered,
+        frames_with_signal,
+        matched_events,
+        rt_profile,
+        mz_profile,
+        im_profile,
+    })
+}
+
+fn build_timsrust_pseudo_ms2(
+    path: &Path,
+    request: &DiaSliceRequest,
+    out_prefix: &Path,
+    options: &PseudoMs2Options,
+    precursor_rt_points: &[(f64, f64)],
+    verbosity: Verbosity,
+) -> anyhow::Result<PseudoMs2Report> {
+    let peptide = request
+        .peptide_target
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("--pseudo-ms2 requires --peptide"))?
+        .clone();
+    if peptide.fragments.is_empty() {
+        anyhow::bail!(
+            "peptide {} produced no theoretical fragments",
+            peptide.sequence
+        );
+    }
+
+    let metadata = MetadataReader::new(path)
+        .with_context(|| "failed to read Bruker metadata with timsrust")?;
+    let frame_reader =
+        FrameReader::new(path).with_context(|| "failed to open Bruker .d with timsrust")?;
+    let acquisition = frame_reader.get_acquisition();
+    let precursor_evidence = match (request.rt_min, request.rt_max) {
+        (Some(lo), Some(hi)) => explicit_precursor_rt_evidence(precursor_rt_points, lo, hi),
+        _ => infer_precursor_rt_window_from_points(
+            precursor_rt_points,
+            peptide.precursor_mz,
+            options.rt_window_min,
+        )?,
+    };
+    verbosity.status(format_args!(
+        "Pseudo-MS2: using RT {} and aggregating {} theoretical fragments",
+        precursor_evidence.rt_window.label(),
+        peptide.fragments.len()
+    ));
+
+    let mut accumulators = Vec::<PseudoFragmentAccumulator>::new();
+    for fragment in &peptide.fragments {
+        let (mz_min, mz_max) = mz_window(fragment.mz, request);
+        let (tof_min, tof_max) = tof_bounds(&metadata, mz_min, mz_max)
+            .with_context(|| format!("failed to compute TOF bounds for {}", fragment.label))?;
+        accumulators.push(PseudoFragmentAccumulator {
+            tof_min,
+            tof_max,
+            evidence: PseudoMs2FragmentEvidence {
+                label: fragment.label.clone(),
+                series: fragment.series.clone(),
+                charge: fragment.charge,
+                mz: fragment.mz,
+                summed_intensity: 0.0,
+                matched_events: 0,
+                frames_with_signal: 0,
+                apex_rt: None,
+                apex_intensity: 0.0,
+            },
+        });
+    }
+
+    let (quad_min, quad_max) = pseudo_ms2_quad_bounds(request, &peptide, acquisition);
+    verbosity.detail(format_args!(
+        "Pseudo-MS2: acquisition={:?} quadrupole filter {:?}-{:?}",
+        acquisition, quad_min, quad_max
+    ));
+    let mut frames_considered = 0usize;
+    let mut frames_with_signal = 0usize;
+    let mut matched_events = 0usize;
+
+    for index in 0..frame_reader.len() {
+        let frame_meta = frame_reader
+            .get_frame_without_coordinates(index)
+            .with_context(|| format!("failed to inspect Bruker frame {}", index + 1))?;
+        if frame_meta.ms_level != MSLevel::MS2 {
+            continue;
+        }
+        let rt_minutes = frame_meta.rt_in_seconds / 60.0;
+        if rt_minutes < precursor_evidence.rt_window.min
+            || rt_minutes > precursor_evidence.rt_window.max
+        {
+            continue;
+        }
+
+        frames_considered += 1;
+        let frame = frame_reader
+            .get(index)
+            .with_context(|| format!("failed to read Bruker frame {}", index + 1))?;
+        let mut frame_intensities = vec![0.0_f64; accumulators.len()];
+        let mut frame_events = vec![0usize; accumulators.len()];
+
+        for scan_index in 0..frame.scan_offsets.len().saturating_sub(1) {
+            let mobility = metadata.im_converter.convert(scan_index as u32);
+            if !mobility_in_window(mobility, request.im_min, request.im_max) {
+                continue;
+            }
+            if !quad_in_window(&frame, scan_index, quad_min, quad_max) {
+                continue;
+            }
+
+            let start = frame.scan_offsets[scan_index];
+            let end = frame.scan_offsets[scan_index + 1];
+            if start >= end {
+                continue;
+            }
+            let scan_tofs = &frame.tof_indices[start..end];
+            for frag_idx in 0..accumulators.len() {
+                let peak_start =
+                    scan_tofs.partition_point(|tof| *tof < accumulators[frag_idx].tof_min);
+                let peak_end =
+                    scan_tofs.partition_point(|tof| *tof <= accumulators[frag_idx].tof_max);
+                for relative_peak_index in peak_start..peak_end {
+                    let peak_index = start + relative_peak_index;
+                    let intensity = frame.get_corrected_intensity(peak_index);
+                    if !intensity.is_finite() || intensity <= 0.0 {
+                        continue;
+                    }
+                    accumulators[frag_idx].evidence.summed_intensity += intensity;
+                    accumulators[frag_idx].evidence.matched_events += 1;
+                    frame_intensities[frag_idx] += intensity;
+                    frame_events[frag_idx] += 1;
+                }
+            }
+        }
+
+        let mut frame_has_signal = false;
+        for (frag_idx, frame_intensity) in frame_intensities.iter().copied().enumerate() {
+            let events = frame_events[frag_idx];
+            if events == 0 {
+                continue;
+            }
+            frame_has_signal = true;
+            matched_events += events;
+            let evidence = &mut accumulators[frag_idx].evidence;
+            evidence.frames_with_signal += 1;
+            if frame_intensity > evidence.apex_intensity {
+                evidence.apex_intensity = frame_intensity;
+                evidence.apex_rt = Some(rt_minutes);
+            }
+        }
+        if frame_has_signal {
+            frames_with_signal += 1;
+        }
+    }
+
+    Ok(PseudoMs2Report {
+        input_path: path.to_path_buf(),
+        out_prefix: out_prefix.to_path_buf(),
+        peptide,
+        rt_window: precursor_evidence.rt_window,
+        frames_considered,
+        frames_with_signal,
+        matched_events,
+        precursor_frames_with_signal: precursor_evidence.frames_with_signal,
+        precursor_apex_rt: precursor_evidence.apex_rt,
+        precursor_apex_intensity: precursor_evidence.apex_intensity,
+        fragments: accumulators
+            .into_iter()
+            .map(|accumulator| accumulator.evidence)
+            .collect(),
+    })
+}
+
+#[derive(Clone, Debug)]
+struct PseudoFragmentAccumulator {
+    tof_min: u32,
+    tof_max: u32,
+    evidence: PseudoMs2FragmentEvidence,
+}
+
+#[derive(Clone, Debug)]
+struct PrecursorRtEvidence {
+    rt_window: PseudoMs2RtWindow,
+    frames_with_signal: usize,
+    apex_rt: Option<f64>,
+    apex_intensity: f64,
+}
+
+fn explicit_precursor_rt_evidence(
+    points: &[(f64, f64)],
+    rt_min: f64,
+    rt_max: f64,
+) -> PrecursorRtEvidence {
+    let mut filtered = points
+        .iter()
+        .copied()
+        .filter(|(rt, intensity)| {
+            rt.is_finite()
+                && *rt >= rt_min
+                && *rt <= rt_max
+                && intensity.is_finite()
+                && *intensity > 0.0
+        })
+        .collect::<Vec<_>>();
+    filtered.sort_by(|left, right| {
+        left.0
+            .partial_cmp(&right.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let (apex_rt, apex_intensity) = filtered
+        .iter()
+        .copied()
+        .max_by(|left, right| {
+            left.1
+                .partial_cmp(&right.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(rt, intensity)| (Some(rt), intensity))
+        .unwrap_or((None, 0.0));
+    PrecursorRtEvidence {
+        rt_window: PseudoMs2RtWindow {
+            min: rt_min,
+            max: rt_max,
+            source: "explicit",
+        },
+        frames_with_signal: filtered.len(),
+        apex_rt,
+        apex_intensity,
+    }
+}
+
+fn infer_precursor_rt_window_from_points(
+    points: &[(f64, f64)],
+    precursor_mz: f64,
+    window_min: f64,
+) -> anyhow::Result<PrecursorRtEvidence> {
+    let mut points = points
+        .iter()
+        .copied()
+        .filter(|(rt, intensity)| rt.is_finite() && intensity.is_finite() && *intensity > 0.0)
+        .collect::<Vec<_>>();
+    if points.is_empty() {
+        anyhow::bail!(
+            "could not infer pseudo-MS2 RT window: no extracted precursor signal for m/z {:.4}; pass --rt-min/--rt-max explicitly",
+            precursor_mz
+        );
+    }
+    points.sort_by(|left, right| {
+        left.0
+            .partial_cmp(&right.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let (rt_window, apex_rt, apex_intensity) = best_precursor_rt_window(&points, window_min);
+    Ok(PrecursorRtEvidence {
+        rt_window,
+        frames_with_signal: points.len(),
+        apex_rt: Some(apex_rt),
+        apex_intensity,
+    })
+}
+
+fn best_precursor_rt_window(
+    points: &[(f64, f64)],
+    window_min: f64,
+) -> (PseudoMs2RtWindow, f64, f64) {
+    let mut best_start = points[0].0;
+    let mut best_sum = f64::NEG_INFINITY;
+    let mut best_left = 0usize;
+    let mut best_right = 0usize;
+    let mut right = 0usize;
+    let mut running = 0.0;
+
+    for left in 0..points.len() {
+        let start = points[left].0;
+        while right < points.len() && points[right].0 <= start + window_min {
+            running += points[right].1;
+            right += 1;
+        }
+        if running > best_sum {
+            best_sum = running;
+            best_start = start;
+            best_left = left;
+            best_right = right;
+        }
+        running -= points[left].1;
+    }
+
+    let (apex_rt, apex_intensity) = points[best_left..best_right]
+        .iter()
+        .copied()
+        .max_by(|left, right| {
+            left.1
+                .partial_cmp(&right.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap_or(points[best_left]);
+    (
+        PseudoMs2RtWindow {
+            min: best_start,
+            max: best_start + window_min,
+            source: "precursor-inferred",
+        },
+        apex_rt,
+        apex_intensity,
+    )
+}
+
+fn mz_window(center: f64, request: &DiaSliceRequest) -> (f64, f64) {
+    let delta = request
+        .mz_da
+        .unwrap_or_else(|| center * request.mz_ppm / 1_000_000.0);
+    (center - delta, center + delta)
+}
+
+fn tof_bounds(metadata: &Metadata, mz_min: f64, mz_max: f64) -> anyhow::Result<(u32, u32)> {
+    let tof_min = metadata.mz_converter.invert(mz_min).floor().max(0.0);
+    let tof_max = metadata.mz_converter.invert(mz_max).ceil().max(0.0);
+    if !tof_min.is_finite() || !tof_max.is_finite() || tof_min > tof_max {
+        anyhow::bail!(
+            "timsrust produced invalid TOF bounds for m/z {:.4}-{:.4}",
+            mz_min,
+            mz_max
+        );
+    }
+    Ok((tof_min as u32, tof_max as u32))
+}
+
+fn pseudo_ms2_quad_bounds(
+    request: &DiaSliceRequest,
+    peptide: &DiaPeptideTarget,
+    acquisition: AcquisitionType,
+) -> (Option<f64>, Option<f64>) {
+    match (request.quad_min, request.quad_max) {
+        (Some(lo), Some(hi)) => (Some(lo), Some(hi)),
+        _ if acquisition == AcquisitionType::DIAPASEF => {
+            (Some(peptide.precursor_mz), Some(peptide.precursor_mz))
+        }
+        _ => (None, None),
+    }
+}
+
+fn rt_seconds_in_window(rt_seconds: f64, rt_min: Option<f64>, rt_max: Option<f64>) -> bool {
+    match (rt_min, rt_max) {
+        (Some(lo), Some(hi)) => rt_seconds >= lo * 60.0 && rt_seconds <= hi * 60.0,
+        _ => true,
+    }
+}
+
+fn mobility_in_window(mobility: f64, im_min: Option<f64>, im_max: Option<f64>) -> bool {
+    match (im_min, im_max) {
+        (Some(lo), Some(hi)) => mobility >= lo && mobility <= hi,
+        _ => true,
+    }
+}
+
+fn quad_in_window(
+    frame: &Frame,
+    scan_index: usize,
+    quad_min: Option<f64>,
+    quad_max: Option<f64>,
+) -> bool {
+    let (Some(lo), Some(hi)) = (quad_min, quad_max) else {
+        return true;
+    };
+    let settings = frame.quadrupole_settings.as_ref();
+    if settings.len() == 0 {
+        return false;
+    }
+    settings
+        .scan_starts
+        .iter()
+        .zip(settings.scan_ends.iter())
+        .zip(
+            settings
+                .isolation_mz
+                .iter()
+                .zip(settings.isolation_width.iter()),
+        )
+        .any(
+            |((scan_start, scan_end), (isolation_mz, isolation_width))| {
+                if scan_index < *scan_start || scan_index >= *scan_end {
+                    return false;
+                }
+                let half_width = *isolation_width / 2.0;
+                let window_min = *isolation_mz - half_width;
+                let window_max = *isolation_mz + half_width;
+                window_min <= hi && window_max >= lo
+            },
+        )
+}
+
+fn timsrust_acquisition_label(acquisition: AcquisitionType) -> &'static str {
+    match acquisition {
+        AcquisitionType::DDAPASEF => "ddaPASEF",
+        AcquisitionType::DIAPASEF => "diaPASEF",
+        AcquisitionType::DiagonalDIAPASEF => "diagonal diaPASEF",
+        AcquisitionType::Unknown => "unknown",
+    }
+}
+
+fn resolve_python(python_override: Option<&Path>) -> anyhow::Result<PathBuf> {
+    if let Some(path) = python_override {
+        return Ok(path.to_path_buf());
+    }
+    if let Some(path) = env::var_os(BRUKER_PYTHON_ENV_VAR).map(PathBuf::from) {
+        return Ok(path);
+    }
+
+    for candidate in ["python", "python3"] {
+        if Command::new(candidate).arg("--version").output().is_ok() {
+            return Ok(PathBuf::from(candidate));
+        }
+    }
+
+    anyhow::bail!(
+        "Bruker .d support via alphaTims requires a Python interpreter. Pass --python <exe> or set {}",
+        BRUKER_PYTHON_ENV_VAR
+    );
+}
+
+fn run_bruker_bridge(
+    path: &Path,
+    request: &DiaSliceRequest,
+    runtime_path: &Path,
+    python: &Path,
+    mz_profile_bins: usize,
+) -> anyhow::Result<BrukerBridgePayload> {
+    let script_path = write_temp_bridge_script()?;
+    let mut command = Command::new(python);
+    command
+        .arg(script_path.as_path())
+        .arg("--bruker")
+        .arg(path)
+        .arg("--bruker-so")
+        .arg(runtime_path)
+        .arg("--mz")
+        .arg(request.mz.to_string())
+        .arg("--mz-ppm")
+        .arg(request.mz_ppm.to_string())
+        .arg("--mz-bins")
+        .arg(mz_profile_bins.to_string())
+        .env("PYTHONUNBUFFERED", "1");
+
+    if let Some(value) = request.mz_da {
+        command.arg("--mz-da").arg(value.to_string());
+    }
+    if let (Some(lo), Some(hi)) = (request.rt_min, request.rt_max) {
+        command
+            .arg("--rt-min")
+            .arg(lo.to_string())
+            .arg("--rt-max")
+            .arg(hi.to_string());
+    }
+    if let (Some(lo), Some(hi)) = (request.im_min, request.im_max) {
+        command
+            .arg("--im-min")
+            .arg(lo.to_string())
+            .arg("--im-max")
+            .arg(hi.to_string());
+    }
+    if let (Some(lo), Some(hi)) = (request.quad_min, request.quad_max) {
+        command
+            .arg("--quad-min")
+            .arg(lo.to_string())
+            .arg("--quad-max")
+            .arg(hi.to_string());
+    }
+
+    let output = command
+        .output()
+        .with_context(|| format!("failed to launch Python bridge `{}`", python.display()))?;
+    let _ = fs::remove_file(&script_path);
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        anyhow::bail!(
+            "Bruker alphaTims bridge failed.\nstdout:\n{}\n\nstderr:\n{}",
+            stdout.trim(),
+            stderr.trim()
+        );
+    }
+
+    serde_json::from_slice::<BrukerBridgePayload>(&output.stdout)
+        .context("failed to parse JSON from Bruker alphaTims bridge")
+}
+
+fn resolve_bruker_runtime(bruker_so_override: Option<&Path>) -> anyhow::Result<BrukerRuntime> {
+    if let Some(path) = bruker_so_override {
+        return load_bruker_runtime_candidate(path).with_context(|| {
+            format!(
+                "Bruker .d support requires timsdata.so. The explicit --bruker-so path did not work. Try a valid library path or place timsdata.so at {}",
+                DEFAULT_BRUKER_SO_PATHS[0]
+            )
+        });
+    }
+
+    if let Some(path) = env::var_os(BRUKER_SO_ENV_VAR).map(PathBuf::from) {
+        return load_bruker_runtime_candidate(path.as_path()).with_context(|| {
+            format!(
+                "Bruker .d support requires timsdata.so. The {BRUKER_SO_ENV_VAR} override did not work. Try a valid library path or place timsdata.so at {}",
+                DEFAULT_BRUKER_SO_PATHS[0]
+            )
+        });
+    }
+
+    let mut checked = Vec::<PathBuf>::new();
+    let mut failures = Vec::<String>::new();
+    for candidate in DEFAULT_BRUKER_SO_PATHS {
+        let path = PathBuf::from(candidate);
+        checked.push(path.clone());
+        if !path.exists() {
+            continue;
+        }
+        match load_bruker_runtime_candidate(path.as_path()) {
+            Ok(runtime) => return Ok(runtime),
+            Err(err) => failures.push(format!("{} ({err:#})", path.display())),
+        }
+    }
+
+    let checked_list = checked
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if failures.is_empty() {
+        anyhow::bail!(
+            "Bruker .d support requires timsdata.so. Checked: {}. Pass --bruker-so <path>, set {}, or place timsdata.so at {}",
+            checked_list,
+            BRUKER_SO_ENV_VAR,
+            DEFAULT_BRUKER_SO_PATHS[0]
+        );
+    }
+    anyhow::bail!(
+        "Bruker .d support found candidate timsdata.so files, but none could be loaded. Checked: {}. Load failures: {}",
+        checked_list,
+        failures.join("; ")
+    );
+}
+
+fn load_bruker_runtime_candidate(path: &Path) -> anyhow::Result<BrukerRuntime> {
+    if !path.exists() {
+        anyhow::bail!("missing {}", path.display());
+    }
+    if !path.is_file() {
+        anyhow::bail!("{} is not a file", path.display());
+    }
+    unsafe { Library::new(path) }.with_context(|| format!("failed to load {}", path.display()))?;
+    Ok(BrukerRuntime {
+        path: path.to_path_buf(),
+    })
+}
+
+fn initialize_mz_bins(bins: &mut [MzProfileBin], mz_min: f64, mz_max: f64) {
+    if bins.is_empty() {
+        return;
+    }
+    if bins.len() == 1 {
+        bins[0].mz_center = (mz_min + mz_max) / 2.0;
+        return;
+    }
+    let span = mz_max - mz_min;
+    let len = bins.len();
+    for (idx, bin) in bins.iter_mut().enumerate() {
+        let frac = idx as f64 / (len - 1) as f64;
+        bin.mz_center = mz_min + span * frac;
+    }
+}
+
+fn accumulate_mz_bin(bins: &mut [MzProfileBin], mz_min: f64, mz_max: f64, mz: f64, intensity: f64) {
+    if bins.is_empty() {
+        return;
+    }
+    if bins.len() == 1 || (mz_max - mz_min).abs() <= f64::EPSILON {
+        bins[0].summed_intensity += intensity;
+        return;
+    }
+    let frac = ((mz - mz_min) / (mz_max - mz_min)).clamp(0.0, 1.0);
+    let idx = ((bins.len() - 1) as f64 * frac).round() as usize;
+    bins[idx.min(bins.len() - 1)].summed_intensity += intensity;
+}
+
+fn initialize_mz_histogram_bins(bins: &mut [MzProfileBin], mz_min: f64, mz_max: f64) {
+    if bins.is_empty() {
+        return;
+    }
+    if bins.len() == 1 {
+        bins[0].mz_center = (mz_min + mz_max) / 2.0;
+        return;
+    }
+    let width = (mz_max - mz_min) / bins.len() as f64;
+    for (idx, bin) in bins.iter_mut().enumerate() {
+        bin.mz_center = mz_min + (idx as f64 + 0.5) * width;
+    }
+}
+
+fn accumulate_mz_histogram_bin(
+    bins: &mut [MzProfileBin],
+    mz_min: f64,
+    mz_max: f64,
+    mz: f64,
+    intensity: f64,
+) {
+    if bins.is_empty() {
+        return;
+    }
+    if bins.len() == 1 || (mz_max - mz_min).abs() <= f64::EPSILON {
+        bins[0].summed_intensity += intensity;
+        return;
+    }
+    let width = (mz_max - mz_min) / bins.len() as f64;
+    if width <= 0.0 || !width.is_finite() {
+        return;
+    }
+    let idx = ((mz - mz_min) / width).floor() as isize;
+    let idx = idx.clamp(0, bins.len() as isize - 1) as usize;
+    bins[idx].summed_intensity += intensity;
+}
+
+fn rt_in_window(rt_minutes: Option<f64>, rt_min: Option<f64>, rt_max: Option<f64>) -> bool {
+    match (rt_minutes, rt_min, rt_max) {
+        (_, None, None) => true,
+        (Some(rt), Some(lo), Some(hi)) => rt >= lo && rt <= hi,
+        _ => false,
+    }
+}
+
+fn write_outputs(
+    summary: &DiaSliceSummary,
+    request: &DiaSliceRequest,
+    rt_rows: &[RtProfileRow],
+    mz_bins: &[MzProfileBin],
+    im_rows: Option<&[MobilityProfileRow]>,
+) -> anyhow::Result<()> {
+    if let Some(parent) = summary.out_prefix.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+    }
+
+    write_summary_text(summary, request)?;
+    write_rt_profile(summary, rt_rows)?;
+    write_mz_profile(summary, mz_bins)?;
+    write_im_profile(summary, im_rows)?;
+    write_summary_svg(summary, request, rt_rows, mz_bins, im_rows)?;
+    Ok(())
+}
+
+fn write_pseudo_ms2_outputs(report: &PseudoMs2Report) -> anyhow::Result<()> {
+    if let Some(parent) = report.out_prefix.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+    }
+    write_pseudo_ms2_tsv(report)?;
+    write_pseudo_ms2_svg(report)?;
+    Ok(())
+}
+
+fn write_pseudo_ms2_tsv(report: &PseudoMs2Report) -> anyhow::Result<()> {
+    let path = output_path(&report.out_prefix, "pseudo_ms2.tsv");
+    let mut file =
+        File::create(&path).with_context(|| format!("failed to create {}", path.display()))?;
+    writeln!(file, "# source\t{}", report.input_path.display())?;
+    writeln!(
+        file,
+        "# peptide_input\t{}",
+        sanitize_tsv(&report.peptide.input)
+    )?;
+    writeln!(
+        file,
+        "# peptide_modified_sequence\t{}",
+        sanitize_tsv(&report.peptide.modified_sequence)
+    )?;
+    writeln!(file, "# peptide_charge\t{}", report.peptide.charge)?;
+    writeln!(file, "# precursor_mz\t{:.6}", report.peptide.precursor_mz)?;
+    writeln!(file, "# rt_window\t{}", report.rt_window.label())?;
+    writeln!(
+        file,
+        "# precursor_rt_apex\t{}\t{:.6}",
+        format_optional_f64(report.precursor_apex_rt, 6),
+        report.precursor_apex_intensity
+    )?;
+    writeln!(
+        file,
+        "# precursor_frames_with_signal\t{}",
+        report.precursor_frames_with_signal
+    )?;
+    writeln!(
+        file,
+        "# frames_considered\t{}\tframes_with_signal\t{}\tmatched_events\t{}",
+        report.frames_considered, report.frames_with_signal, report.matched_events
+    )?;
+    writeln!(
+        file,
+        "fragment\tseries\tcharge\tmz\tsummed_intensity\tmatched_events\tframes_with_signal\tapex_rt\tapex_intensity"
+    )?;
+    for row in &report.fragments {
+        writeln!(
+            file,
+            "{}\t{}\t{}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{:.6}",
+            row.label,
+            row.series,
+            row.charge,
+            row.mz,
+            row.summed_intensity,
+            row.matched_events,
+            row.frames_with_signal,
+            format_optional_f64(row.apex_rt, 6),
+            row.apex_intensity,
+        )?;
+    }
+    Ok(())
+}
+
+fn write_pseudo_ms2_svg(report: &PseudoMs2Report) -> anyhow::Result<()> {
+    let path = output_path(&report.out_prefix, "pseudo_ms2.svg");
+    let mut svg = String::new();
+    let width = SVG_WIDTH;
+    let height = 820u32;
+    let _ = writeln!(
+        svg,
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w}\" height=\"{h}\" viewBox=\"0 0 {w} {h}\">",
+        w = width,
+        h = height
+    );
+    let _ = writeln!(
+        svg,
+        "<rect x=\"0\" y=\"0\" width=\"100%\" height=\"100%\" fill=\"{}\"/>",
+        COLOR_BG
+    );
+
+    append_mono_text_lines(
+        &mut svg,
+        SVG_MARGIN_X,
+        44.0,
+        SVG_TITLE_FONT,
+        30.0,
+        COLOR_TEXT,
+        Some("700"),
+        &["Pseudo-MS2 fragment evidence".to_string()],
+    );
+    append_mono_text_lines(
+        &mut svg,
+        SVG_MARGIN_X,
+        70.0,
+        SVG_META_FONT,
+        20.0,
+        COLOR_SUBTLE,
+        None,
+        &wrap_mono_text(
+            &format!("Source: {}", compact_display_path(&report.input_path, 78)),
+            SVG_META_FONT,
+            width as f64 - 2.0 * SVG_MARGIN_X,
+            1,
+        ),
+    );
+    append_mono_text_lines(
+        &mut svg,
+        SVG_MARGIN_X,
+        96.0,
+        SVG_META_FONT,
+        20.0,
+        COLOR_SUBTLE,
+        None,
+        &wrap_mono_text(
+            &format!(
+                "Target: {}/{} precursor m/z {:.4} | RT {} | {} frames, {} with signal",
+                report.peptide.modified_sequence,
+                report.peptide.charge,
+                report.peptide.precursor_mz,
+                report.rt_window.label(),
+                report.frames_considered,
+                report.frames_with_signal
+            ),
+            SVG_META_FONT,
+            width as f64 - 2.0 * SVG_MARGIN_X,
+            2,
+        ),
+    );
+    append_mono_text_lines(
+        &mut svg,
+        SVG_MARGIN_X,
+        136.0,
+        SVG_META_FONT,
+        20.0,
+        COLOR_SUBTLE,
+        None,
+        &wrap_mono_text(
+            &format!(
+                "Precursor RT evidence: {} frames with signal, apex RT {} min, apex intensity {:.2e}",
+                report.precursor_frames_with_signal,
+                format_optional_f64(report.precursor_apex_rt, 3),
+                report.precursor_apex_intensity,
+            ),
+            SVG_META_FONT,
+            width as f64 - 2.0 * SVG_MARGIN_X,
+            1,
+        ),
+    );
+
+    let x_domain = padded_range(report.fragments.iter().map(|row| row.mz));
+    let y_domain = padded_y_range(report.fragments.iter().map(|row| row.summed_intensity));
+    let canvas = SvgCanvas::new(96.0, 210.0, 1094.0, 410.0, x_domain, y_domain);
+    draw_pseudo_ms2_axes(&mut svg, canvas, x_domain, y_domain);
+    draw_pseudo_ms2_sticks(&mut svg, canvas, &report.fragments);
+    draw_pseudo_ms2_legend(&mut svg, canvas.right() - 210.0, canvas.top() - 26.0);
+
+    let _ = writeln!(
+        svg,
+        "<text x=\"{:.2}\" y=\"{:.2}\" font-size=\"14\" fill=\"{}\" font-family=\"Menlo, Consolas, Liberation Mono, monospace\">grey ticks are theoretical fragments with no detected signal in the bounded DIA evidence window</text>",
+        canvas.left(),
+        canvas.bottom() + 86.0,
+        COLOR_SUBTLE
+    );
+    svg.push_str("</svg>\n");
+    fs::write(&path, svg).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
+fn draw_pseudo_ms2_axes(
+    svg: &mut String,
+    canvas: SvgCanvas,
+    x_domain: CoordinateRange<f64>,
+    y_domain: CoordinateRange<f64>,
+) {
+    let _ = writeln!(
+        svg,
+        "<rect x=\"{:.2}\" y=\"{:.2}\" width=\"{:.2}\" height=\"{:.2}\" rx=\"12\" fill=\"#fbfdff\" stroke=\"{}\" stroke-width=\"1\"/>",
+        canvas.left() - 24.0,
+        canvas.top() - 46.0,
+        canvas.width() + 48.0,
+        canvas.height() + 120.0,
+        COLOR_CARD_BORDER
+    );
+    let x_ticks = linear_ticks(x_domain.min(), x_domain.max(), 6);
+    let y_ticks = linear_ticks(y_domain.min(), y_domain.max(), 5);
+    for tick in x_ticks {
+        let px = canvas.x(tick);
+        let _ = writeln!(
+            svg,
+            "<line x1=\"{:.2}\" y1=\"{:.2}\" x2=\"{:.2}\" y2=\"{:.2}\" stroke=\"{}\" stroke-width=\"1\"/>",
+            px,
+            canvas.top(),
+            px,
+            canvas.bottom(),
+            COLOR_GRID
+        );
+        let _ = writeln!(
+            svg,
+            "<text x=\"{:.2}\" y=\"{:.2}\" font-size=\"{:.1}\" text-anchor=\"middle\" fill=\"{}\" font-family=\"Menlo, Consolas, Liberation Mono, monospace\">{:.1}</text>",
+            px,
+            canvas.bottom() + 28.0,
+            SVG_TICK_FONT,
+            COLOR_SUBTLE,
+            tick
+        );
+    }
+    for tick in y_ticks {
+        let py = canvas.y(tick);
+        let _ = writeln!(
+            svg,
+            "<line x1=\"{:.2}\" y1=\"{:.2}\" x2=\"{:.2}\" y2=\"{:.2}\" stroke=\"{}\" stroke-width=\"1\"/>",
+            canvas.left(),
+            py,
+            canvas.right(),
+            py,
+            COLOR_GRID
+        );
+        let _ = writeln!(
+            svg,
+            "<text x=\"{:.2}\" y=\"{:.2}\" font-size=\"{:.1}\" text-anchor=\"end\" dominant-baseline=\"middle\" fill=\"{}\" font-family=\"Menlo, Consolas, Liberation Mono, monospace\">{:.2e}</text>",
+            canvas.left() - 12.0,
+            py,
+            SVG_TICK_FONT,
+            COLOR_SUBTLE,
+            tick
+        );
+    }
+    let _ = writeln!(
+        svg,
+        "<rect x=\"{:.2}\" y=\"{:.2}\" width=\"{:.2}\" height=\"{:.2}\" fill=\"none\" stroke=\"{}\" stroke-width=\"1.2\"/>",
+        canvas.left(),
+        canvas.top(),
+        canvas.width(),
+        canvas.height(),
+        COLOR_AXIS
+    );
+    let _ = writeln!(
+        svg,
+        "<text x=\"{:.2}\" y=\"{:.2}\" font-size=\"{:.1}\" text-anchor=\"middle\" fill=\"{}\" font-family=\"Menlo, Consolas, Liberation Mono, monospace\">fragment m/z</text>",
+        canvas.left() + canvas.width() / 2.0,
+        canvas.bottom() + 58.0,
+        SVG_AXIS_LABEL_FONT,
+        COLOR_TEXT
+    );
+    let _ = writeln!(
+        svg,
+        "<text x=\"{:.2}\" y=\"{:.2}\" font-size=\"{:.1}\" text-anchor=\"middle\" fill=\"{}\" font-family=\"Menlo, Consolas, Liberation Mono, monospace\" transform=\"rotate(-90 {:.2} {:.2})\">summed extracted intensity</text>",
+        canvas.left() - 66.0,
+        canvas.top() + canvas.height() / 2.0,
+        SVG_AXIS_LABEL_FONT,
+        COLOR_SUBTLE,
+        canvas.left() - 66.0,
+        canvas.top() + canvas.height() / 2.0
+    );
+}
+
+fn draw_pseudo_ms2_sticks(
+    svg: &mut String,
+    canvas: SvgCanvas,
+    fragments: &[PseudoMs2FragmentEvidence],
+) {
+    let baseline = canvas.y(0.0);
+    let mut ranked = fragments
+        .iter()
+        .filter(|row| row.summed_intensity > 0.0)
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        right
+            .summed_intensity
+            .partial_cmp(&left.summed_intensity)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let label_cutoff = ranked
+        .get(9)
+        .map(|row| row.summed_intensity)
+        .unwrap_or(f64::INFINITY);
+
+    for row in fragments {
+        let x = canvas.x(row.mz);
+        if row.summed_intensity <= 0.0 {
+            let _ = writeln!(
+                svg,
+                "<line x1=\"{x:.2}\" y1=\"{y1:.2}\" x2=\"{x:.2}\" y2=\"{y2:.2}\" stroke=\"#aeb8c4\" stroke-width=\"1.1\"/>",
+                y1 = baseline,
+                y2 = baseline - 9.0
+            );
+            continue;
+        }
+        let y = canvas.y(row.summed_intensity);
+        let color = pseudo_ms2_series_color(&row.series);
+        let _ = writeln!(
+            svg,
+            "<line x1=\"{x:.2}\" y1=\"{baseline:.2}\" x2=\"{x:.2}\" y2=\"{y:.2}\" stroke=\"{color}\" stroke-width=\"2.4\" stroke-linecap=\"round\"/>"
+        );
+        let _ = writeln!(
+            svg,
+            "<circle cx=\"{x:.2}\" cy=\"{y:.2}\" r=\"3.4\" fill=\"{color}\"><title>{}: {:.4} m/z, {:.3e}</title></circle>",
+            escape_xml(&row.label),
+            row.mz,
+            row.summed_intensity
+        );
+        if row.summed_intensity >= label_cutoff {
+            let _ = writeln!(
+                svg,
+                "<text x=\"{x:.2}\" y=\"{label_y:.2}\" font-size=\"13\" text-anchor=\"middle\" fill=\"{}\" font-family=\"Menlo, Consolas, Liberation Mono, monospace\">{}</text>",
+                COLOR_TEXT,
+                escape_xml(&row.label),
+                label_y = (y - 10.0).max(canvas.top() + 14.0)
+            );
+        }
+    }
+}
+
+fn draw_pseudo_ms2_legend(svg: &mut String, x: f64, y: f64) {
+    for (idx, (label, color)) in [("b ions", "#1d4ed8"), ("y ions", "#b45309")]
+        .iter()
+        .enumerate()
+    {
+        let y = y + idx as f64 * 18.0;
+        let _ = writeln!(
+            svg,
+            "<line x1=\"{x:.2}\" y1=\"{y:.2}\" x2=\"{x2:.2}\" y2=\"{y:.2}\" stroke=\"{color}\" stroke-width=\"3\"/>",
+            x2 = x + 22.0
+        );
+        let _ = writeln!(
+            svg,
+            "<text x=\"{:.2}\" y=\"{:.2}\" font-size=\"14\" dominant-baseline=\"middle\" fill=\"{}\" font-family=\"Menlo, Consolas, Liberation Mono, monospace\">{}</text>",
+            x + 30.0,
+            y,
+            COLOR_SUBTLE,
+            label
+        );
+    }
+}
+
+fn pseudo_ms2_series_color(series: &str) -> &'static str {
+    match series {
+        "b" => "#1d4ed8",
+        "y" => "#b45309",
+        _ => "#475569",
+    }
+}
+
+fn write_summary_text(summary: &DiaSliceSummary, request: &DiaSliceRequest) -> anyhow::Result<()> {
+    let path = output_path(&summary.out_prefix, "summary.txt");
+    let mut file =
+        File::create(&path).with_context(|| format!("failed to create {}", path.display()))?;
+    writeln!(file, "backend\t{}", summary.backend_label)?;
+    writeln!(file, "input\t{}", summary.input_path.display())?;
+    writeln!(file, "mz_center\t{:.6}", request.mz)?;
+    writeln!(file, "mz_min\t{:.6}", summary.mz_min)?;
+    writeln!(file, "mz_max\t{:.6}", summary.mz_max)?;
+    if let Some(target) = &request.peptide_target {
+        writeln!(file, "peptide_input\t{}", sanitize_tsv(&target.input))?;
+        writeln!(file, "peptide_sequence\t{}", target.sequence)?;
+        writeln!(
+            file,
+            "peptide_modified_sequence\t{}",
+            sanitize_tsv(&target.modified_sequence)
+        )?;
+        writeln!(file, "peptide_charge\t{}", target.charge)?;
+        writeln!(file, "peptide_precursor_mz\t{:.6}", target.precursor_mz)?;
+        if let Some(fragment) = &target.fragment {
+            writeln!(
+                file,
+                "peptide_fragment_input\t{}",
+                sanitize_tsv(&fragment.input)
+            )?;
+            writeln!(file, "peptide_fragment_label\t{}", fragment.label)?;
+            writeln!(file, "peptide_fragment_mz\t{:.6}", fragment.mz)?;
+        }
+    }
+    writeln!(file, "rt_window\t{}", request.rt_window_label())?;
+    writeln!(file, "spectra_considered\t{}", summary.spectra_considered)?;
+    writeln!(file, "spectra_with_signal\t{}", summary.spectra_with_signal)?;
+    writeln!(file, "matched_peaks\t{}", summary.matched_peaks)?;
+    writeln!(file, "capabilities\t{}", summary.capabilities.labels())?;
+    if let Some(mode) = &summary.acquisition_mode {
+        writeln!(file, "acquisition_mode\t{}", mode)?;
+    }
+    if let Some(column) = &summary.intensity_column {
+        writeln!(file, "intensity_column\t{}", column)?;
+    }
+    if let Some(path) = &summary.vendor_runtime_path {
+        writeln!(file, "vendor_runtime\t{}", path.display())?;
+    }
+    Ok(())
+}
+
+fn write_rt_profile(summary: &DiaSliceSummary, rt_rows: &[RtProfileRow]) -> anyhow::Result<()> {
+    let path = output_path(&summary.out_prefix, "rt_profile.tsv");
+    let mut file =
+        File::create(&path).with_context(|| format!("failed to create {}", path.display()))?;
+    writeln!(
+        file,
+        "scan_index\tscan_id\trt_minutes\tsummed_intensity\tmatched_peaks\tprecursor_mz"
+    )?;
+    for row in rt_rows {
+        writeln!(
+            file,
+            "{}\t{}\t{}\t{:.6}\t{}\t{}",
+            row.scan_index,
+            sanitize_tsv(&row.scan_id),
+            format_optional_f64(row.rt_minutes, 6),
+            row.summed_intensity,
+            row.matched_peaks,
+            format_optional_f64(row.precursor_mz, 6),
+        )?;
+    }
+    Ok(())
+}
+
+fn write_mz_profile(summary: &DiaSliceSummary, mz_bins: &[MzProfileBin]) -> anyhow::Result<()> {
+    let path = output_path(&summary.out_prefix, "mz_profile.tsv");
+    let mut file =
+        File::create(&path).with_context(|| format!("failed to create {}", path.display()))?;
+    writeln!(file, "mz_center\tsummed_intensity")?;
+    for bin in mz_bins {
+        writeln!(file, "{:.6}\t{:.6}", bin.mz_center, bin.summed_intensity)?;
+    }
+    Ok(())
+}
+
+fn write_im_profile(
+    summary: &DiaSliceSummary,
+    im_rows: Option<&[MobilityProfileRow]>,
+) -> anyhow::Result<()> {
+    let Some(im_rows) = im_rows else {
+        return Ok(());
+    };
+    if im_rows.is_empty() {
+        return Ok(());
+    }
+
+    let path = output_path(&summary.out_prefix, "im_profile.tsv");
+    let mut file =
+        File::create(&path).with_context(|| format!("failed to create {}", path.display()))?;
+    writeln!(file, "mobility\tsummed_intensity")?;
+    for row in im_rows {
+        writeln!(file, "{:.6}\t{:.6}", row.mobility, row.summed_intensity)?;
+    }
+    Ok(())
+}
+
+fn write_summary_svg(
+    summary: &DiaSliceSummary,
+    request: &DiaSliceRequest,
+    rt_rows: &[RtProfileRow],
+    mz_bins: &[MzProfileBin],
+    im_rows: Option<&[MobilityProfileRow]>,
+) -> anyhow::Result<()> {
+    let path = output_path(&summary.out_prefix, "svg");
+    let mut svg = String::new();
+    let _ = writeln!(
+        svg,
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w}\" height=\"{h}\" viewBox=\"0 0 {w} {h}\">",
+        w = SVG_WIDTH,
+        h = SVG_HEIGHT
+    );
+    let _ = writeln!(
+        svg,
+        "<rect x=\"0\" y=\"0\" width=\"100%\" height=\"100%\" fill=\"{}\"/>",
+        COLOR_BG
+    );
+
+    let source_label = compact_display_path(&summary.input_path, 78);
+    let title = "DIA slice summary";
+    let source_line = format!("Source: {source_label}");
+    let filter_line = match &request.peptide_target {
+        Some(target) => match &target.fragment {
+            Some(fragment) => format!(
+                "Target: {}/{} fragment {} m/z {:.4} | precursor m/z {:.4} | window {:.4}-{:.4} | RT {}",
+                target.modified_sequence,
+                target.charge,
+                fragment.label,
+                fragment.mz,
+                target.precursor_mz,
+                summary.mz_min,
+                summary.mz_max,
+                request.rt_window_label(),
+            ),
+            None => format!(
+                "Target: {}/{} precursor m/z {:.4} | window {:.4}-{:.4} | RT {}",
+                target.modified_sequence,
+                target.charge,
+                target.precursor_mz,
+                summary.mz_min,
+                summary.mz_max,
+                request.rt_window_label(),
+            ),
+        },
+        None => format!(
+            "m/z {:.4}-{:.4} | RT {}",
+            summary.mz_min,
+            summary.mz_max,
+            request.rt_window_label(),
+        ),
+    };
+    let acquisition_line = format!(
+        "{filter_line} | Backend: {} | Capabilities: {}",
+        summary.backend_label,
+        summary.capabilities.labels(),
+    );
+    let counts_line = format!(
+        "Spectra considered: {} | With signal: {} | Matched peaks: {}",
+        summary.spectra_considered, summary.spectra_with_signal, summary.matched_peaks,
+    );
+    append_mono_text_lines(
+        &mut svg,
+        SVG_MARGIN_X,
+        44.0,
+        SVG_TITLE_FONT,
+        30.0,
+        COLOR_TEXT,
+        Some("700"),
+        &[title.to_string()],
+    );
+    append_mono_text_lines(
+        &mut svg,
+        SVG_MARGIN_X,
+        70.0,
+        SVG_META_FONT,
+        20.0,
+        COLOR_SUBTLE,
+        None,
+        &wrap_mono_text(
+            &source_line,
+            SVG_META_FONT,
+            (SVG_WIDTH as f64) - 2.0 * SVG_MARGIN_X,
+            1,
+        ),
+    );
+    append_mono_text_lines(
+        &mut svg,
+        SVG_MARGIN_X,
+        96.0,
+        SVG_META_FONT,
+        20.0,
+        COLOR_SUBTLE,
+        None,
+        &wrap_mono_text(
+            &acquisition_line,
+            SVG_META_FONT,
+            (SVG_WIDTH as f64) - 2.0 * SVG_MARGIN_X,
+            1,
+        ),
+    );
+    append_mono_text_lines(
+        &mut svg,
+        SVG_MARGIN_X,
+        120.0,
+        SVG_META_FONT,
+        20.0,
+        COLOR_SUBTLE,
+        None,
+        &wrap_mono_text(
+            &counts_line,
+            SVG_META_FONT,
+            (SVG_WIDTH as f64) - 2.0 * SVG_MARGIN_X,
+            1,
+        ),
+    );
+
+    let margin_left = 88.0;
+    let panel_top = 174.0;
+    let panel_width = 1100.0;
+    let chart_count = if im_rows.is_some_and(|rows| !rows.is_empty()) {
+        3
+    } else {
+        2
+    };
+    let panel_height = if chart_count == 3 { 176.0 } else { 280.0 };
+    let panel_gap = if chart_count == 3 { 104.0 } else { 112.0 };
+    let rt_x_domain = rt_x_domain(rt_rows);
+    let rt_y_domain = padded_y_range(rt_rows.iter().map(|row| row.summed_intensity));
+    let rt_canvas = SvgCanvas::new(
+        margin_left,
+        panel_top,
+        panel_width,
+        panel_height,
+        rt_x_domain,
+        rt_y_domain,
+    );
+    let mz_x_domain = mz_x_domain(mz_bins);
+    let mz_y_domain = padded_y_range(mz_bins.iter().map(|bin| bin.summed_intensity));
+    let mz_top = if chart_count == 3 {
+        panel_top + 2.0 * (panel_height + panel_gap)
+    } else {
+        panel_top + panel_height + panel_gap
+    };
+    let mz_canvas = SvgCanvas::new(
+        margin_left,
+        mz_top,
+        panel_width,
+        panel_height,
+        mz_x_domain,
+        mz_y_domain,
+    );
+
+    append_chart(
+        &mut svg,
+        rt_canvas,
+        rt_x_domain,
+        rt_y_domain,
+        "RT profile",
+        if rt_rows.iter().all(|row| row.rt_minutes.is_some()) {
+            AxisProps::new(AxisOrientation::Bottom, "RT (min)")
+                .with_tick_label_style(AxisTickLabelStyle::Precision(2))
+        } else {
+            AxisProps::new(AxisOrientation::Bottom, "scan index")
+                .with_tick_label_style(AxisTickLabelStyle::Precision(0))
+        },
+        AxisProps::new(AxisOrientation::Left, "summed intensity")
+            .with_tick_label_style(AxisTickLabelStyle::Scientific(2)),
+        &rt_points(rt_rows),
+        COLOR_RT,
+    );
+    if let Some(im_rows) = im_rows.filter(|rows| !rows.is_empty()) {
+        let im_x_domain = mobility_x_domain(im_rows);
+        let im_y_domain = padded_y_range(im_rows.iter().map(|row| row.summed_intensity));
+        let im_canvas = SvgCanvas::new(
+            margin_left,
+            panel_top + (panel_height + panel_gap),
+            panel_width,
+            panel_height,
+            im_x_domain,
+            im_y_domain,
+        );
+        append_chart(
+            &mut svg,
+            im_canvas,
+            im_x_domain,
+            im_y_domain,
+            "Mobility profile",
+            AxisProps::new(AxisOrientation::Bottom, "1/K0")
+                .with_tick_label_style(AxisTickLabelStyle::Precision(4)),
+            AxisProps::new(AxisOrientation::Left, "summed intensity")
+                .with_tick_label_style(AxisTickLabelStyle::Scientific(2)),
+            &mobility_points(im_rows),
+            "#0f766e",
+        );
+    }
+    append_chart(
+        &mut svg,
+        mz_canvas,
+        mz_x_domain,
+        mz_y_domain,
+        "m/z profile",
+        AxisProps::new(AxisOrientation::Bottom, "m/z")
+            .with_tick_label_style(AxisTickLabelStyle::Precision(4)),
+        AxisProps::new(AxisOrientation::Left, "summed intensity")
+            .with_tick_label_style(AxisTickLabelStyle::Scientific(2)),
+        &mz_points(mz_bins),
+        COLOR_MZ,
+    );
+
+    svg.push_str("</svg>\n");
+    fs::write(&path, svg).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
+fn append_chart(
+    svg: &mut String,
+    canvas: SvgCanvas,
+    x_domain: CoordinateRange<f64>,
+    y_domain: CoordinateRange<f64>,
+    title: &str,
+    x_axis: AxisProps,
+    y_axis: AxisProps,
+    points: &[(f64, f64)],
+    color: &str,
+) {
+    let _ = writeln!(
+        svg,
+        "<rect x=\"{:.2}\" y=\"{:.2}\" width=\"{:.2}\" height=\"{:.2}\" rx=\"12\" fill=\"#fbfdff\" stroke=\"{}\" stroke-width=\"1\"/>",
+        canvas.left() - 14.0,
+        canvas.top() - 38.0,
+        canvas.width() + 28.0,
+        canvas.height() + 112.0,
+        COLOR_CARD_BORDER
+    );
+    let _ = writeln!(
+        svg,
+        "<text x=\"{:.2}\" y=\"{:.2}\" font-size=\"{:.1}\" fill=\"{}\" font-family=\"Menlo, Consolas, Liberation Mono, monospace\">{}</text>",
+        canvas.left(),
+        canvas.top() - 16.0,
+        SVG_PANEL_TITLE_FONT,
+        COLOR_TEXT,
+        escape_xml(title)
+    );
+
+    let x_ticks = linear_ticks(x_domain.min(), x_domain.max(), 5);
+    let y_ticks = linear_ticks(y_domain.min(), y_domain.max(), 5);
+    for tick in x_ticks {
+        let px = canvas.x(tick);
+        let _ = writeln!(
+            svg,
+            "<line x1=\"{:.2}\" y1=\"{:.2}\" x2=\"{:.2}\" y2=\"{:.2}\" stroke=\"{}\" stroke-width=\"1\"/>",
+            px,
+            canvas.top(),
+            px,
+            canvas.bottom(),
+            COLOR_GRID
+        );
+        let _ = writeln!(
+            svg,
+            "<text x=\"{:.2}\" y=\"{:.2}\" font-size=\"{:.1}\" text-anchor=\"middle\" fill=\"{}\" font-family=\"Menlo, Consolas, Liberation Mono, monospace\">{}</text>",
+            px,
+            canvas.bottom() + 28.0,
+            SVG_TICK_FONT,
+            COLOR_SUBTLE,
+            x_axis.format_tick(tick)
+        );
+    }
+    for tick in y_ticks {
+        let py = canvas.y(tick);
+        let _ = writeln!(
+            svg,
+            "<line x1=\"{:.2}\" y1=\"{:.2}\" x2=\"{:.2}\" y2=\"{:.2}\" stroke=\"{}\" stroke-width=\"1\"/>",
+            canvas.left(),
+            py,
+            canvas.right(),
+            py,
+            COLOR_GRID
+        );
+        let _ = writeln!(
+            svg,
+            "<text x=\"{:.2}\" y=\"{:.2}\" font-size=\"{:.1}\" text-anchor=\"end\" dominant-baseline=\"middle\" fill=\"{}\" font-family=\"Menlo, Consolas, Liberation Mono, monospace\">{}</text>",
+            canvas.left() - 12.0,
+            py,
+            SVG_TICK_FONT,
+            COLOR_SUBTLE,
+            y_axis.format_tick(tick)
+        );
+    }
+
+    let _ = writeln!(
+        svg,
+        "<rect x=\"{:.2}\" y=\"{:.2}\" width=\"{:.2}\" height=\"{:.2}\" fill=\"none\" stroke=\"{}\" stroke-width=\"1.2\"/>",
+        canvas.left(),
+        canvas.top(),
+        canvas.width(),
+        canvas.height(),
+        COLOR_AXIS
+    );
+    let _ = writeln!(
+        svg,
+        "<text x=\"{:.2}\" y=\"{:.2}\" font-size=\"{:.1}\" text-anchor=\"middle\" fill=\"{}\" font-family=\"Menlo, Consolas, Liberation Mono, monospace\">{}</text>",
+        canvas.left() + canvas.width() / 2.0,
+        canvas.bottom() + 58.0,
+        SVG_AXIS_LABEL_FONT,
+        COLOR_TEXT,
+        escape_xml(x_axis.label())
+    );
+    let _ = writeln!(
+        svg,
+        "<text x=\"{:.2}\" y=\"{:.2}\" font-size=\"{:.1}\" text-anchor=\"middle\" fill=\"{}\" font-family=\"Menlo, Consolas, Liberation Mono, monospace\" transform=\"rotate(-90 {:.2} {:.2})\">{}</text>",
+        canvas.left() - 64.0,
+        canvas.top() + canvas.height() / 2.0,
+        SVG_AXIS_LABEL_FONT,
+        COLOR_SUBTLE,
+        canvas.left() - 64.0,
+        canvas.top() + canvas.height() / 2.0,
+        escape_xml(y_axis.label())
+    );
+
+    if points.is_empty() {
+        return;
+    }
+    if points.len() == 1 {
+        let (x, y) = canvas.transform(points[0].0, points[0].1);
+        let _ = writeln!(
+            svg,
+            "<circle cx=\"{:.2}\" cy=\"{:.2}\" r=\"4\" fill=\"{}\"/>",
+            x, y, color
+        );
+        return;
+    }
+
+    let mut path_data = String::new();
+    for (idx, (x, y)) in points.iter().enumerate() {
+        let (px, py) = canvas.transform(*x, *y);
+        let command = if idx == 0 { 'M' } else { 'L' };
+        let _ = write!(path_data, "{command}{px:.2},{py:.2} ");
+    }
+    let _ = writeln!(
+        svg,
+        "<path d=\"{}\" fill=\"none\" stroke=\"{}\" stroke-width=\"2.2\" stroke-linejoin=\"round\" stroke-linecap=\"round\"/>",
+        path_data.trim_end(),
+        color
+    );
+}
+
+fn append_mono_text_lines(
+    svg: &mut String,
+    x: f64,
+    first_y: f64,
+    font_size: f64,
+    line_height: f64,
+    fill: &str,
+    font_weight: Option<&str>,
+    lines: &[String],
+) {
+    let weight_attr = font_weight
+        .map(|weight| format!(" font-weight=\"{weight}\""))
+        .unwrap_or_default();
+    for (idx, line) in lines.iter().enumerate() {
+        let _ = writeln!(
+            svg,
+            "<text x=\"{x:.2}\" y=\"{y:.2}\" font-size=\"{font_size:.1}\" fill=\"{fill}\" font-family=\"Menlo, Consolas, Liberation Mono, monospace\"{weight_attr}>{text}</text>",
+            y = first_y + idx as f64 * line_height,
+            text = escape_xml(line)
+        );
+    }
+}
+
+fn wrap_mono_text(text: &str, font_size: f64, max_width: f64, max_lines: usize) -> Vec<String> {
+    let max_chars = mono_char_budget(font_size, max_width);
+    if max_lines == 0 || max_chars == 0 {
+        return Vec::new();
+    }
+
+    let mut lines = Vec::<String>::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let candidate_len = if current.is_empty() {
+            word.chars().count()
+        } else {
+            current.chars().count() + 1 + word.chars().count()
+        };
+        if candidate_len <= max_chars {
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+            continue;
+        }
+
+        if !current.is_empty() {
+            lines.push(current);
+            current = String::new();
+            if lines.len() == max_lines {
+                break;
+            }
+        }
+
+        if word.chars().count() > max_chars {
+            lines.push(truncate_middle(word, max_chars));
+            if lines.len() == max_lines {
+                break;
+            }
+        } else {
+            current.push_str(word);
+        }
+    }
+
+    if !current.is_empty() && lines.len() < max_lines {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    if lines.len() == max_lines && text_is_not_fully_represented(text, &lines) {
+        if let Some(last) = lines.last_mut() {
+            *last = truncate_middle(last, max_chars.saturating_sub(3));
+            last.push_str("...");
+        }
+    }
+    lines
+}
+
+fn text_is_not_fully_represented(original: &str, lines: &[String]) -> bool {
+    let rendered = lines.join(" ");
+    rendered != original && !rendered.ends_with("...")
+}
+
+fn mono_char_budget(font_size: f64, max_width: f64) -> usize {
+    (max_width / (font_size * 0.62)).floor().max(1.0) as usize
+}
+
+fn compact_display_path(path: &Path, max_chars: usize) -> String {
+    let cwd = env::current_dir().ok();
+    let home = env::var_os("HOME").map(PathBuf::from);
+    compact_display_path_with(path, cwd.as_deref(), home.as_deref(), max_chars)
+}
+
+fn compact_display_path_with(
+    path: &Path,
+    cwd: Option<&Path>,
+    home: Option<&Path>,
+    max_chars: usize,
+) -> String {
+    let display = if path.is_relative() {
+        path.to_string_lossy().to_string()
+    } else if let Some(cwd) = cwd.and_then(|cwd| path.strip_prefix(cwd).ok()) {
+        cwd.to_string_lossy().to_string()
+    } else if let Some(home_relative) = home.and_then(|home| path.strip_prefix(home).ok()) {
+        let rest = home_relative.to_string_lossy();
+        if rest.is_empty() {
+            "~".to_string()
+        } else {
+            format!("~/{rest}")
+        }
+    } else {
+        path.to_string_lossy().to_string()
+    };
+    collapse_middle_path(&display, max_chars)
+}
+
+fn collapse_middle_path(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let parts = value.split('/').collect::<Vec<_>>();
+    if parts.len() >= 4 {
+        let prefix_count = if parts.first() == Some(&"~") {
+            3.min(parts.len().saturating_sub(1))
+        } else {
+            2.min(parts.len().saturating_sub(1))
+        };
+        let prefix = parts[..prefix_count].join("/");
+        let suffix = parts.last().copied().unwrap_or_default();
+        let candidate = format!("{prefix}/.../{suffix}");
+        if candidate.chars().count() <= max_chars {
+            return candidate;
+        }
+
+        let reserved = prefix.chars().count() + "/.../".chars().count();
+        let suffix_budget = max_chars.saturating_sub(reserved).max(8);
+        return format!("{prefix}/.../{}", truncate_middle(suffix, suffix_budget));
+    }
+    truncate_middle(value, max_chars)
+}
+
+fn truncate_middle(value: &str, max_chars: usize) -> String {
+    let count = value.chars().count();
+    if count <= max_chars {
+        return value.to_string();
+    }
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+    let remaining = max_chars - 3;
+    let left_count = (remaining + 1) / 2;
+    let right_count = remaining / 2;
+    let left = value.chars().take(left_count).collect::<String>();
+    let right = value
+        .chars()
+        .rev()
+        .take(right_count)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("{left}...{right}")
+}
+
+fn rt_x_domain(rt_rows: &[RtProfileRow]) -> CoordinateRange<f64> {
+    let values = rt_rows
+        .iter()
+        .map(|row| row.rt_minutes.unwrap_or(row.scan_index as f64));
+    padded_range(values)
+}
+
+fn mz_x_domain(mz_bins: &[MzProfileBin]) -> CoordinateRange<f64> {
+    padded_range(mz_bins.iter().map(|bin| bin.mz_center))
+}
+
+fn mobility_x_domain(im_rows: &[MobilityProfileRow]) -> CoordinateRange<f64> {
+    padded_range(im_rows.iter().map(|row| row.mobility))
+}
+
+fn padded_y_range(values: impl Iterator<Item = f64>) -> CoordinateRange<f64> {
+    let max = values.fold(0.0f64, f64::max).max(1.0);
+    CoordinateRange::new(0.0, max * 1.05)
+}
+
+fn padded_range(values: impl Iterator<Item = f64>) -> CoordinateRange<f64> {
+    let values = values.filter(|value| value.is_finite()).collect::<Vec<_>>();
+    let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    if !min.is_finite() || !max.is_finite() {
+        return CoordinateRange::new(0.0, 1.0);
+    }
+    if (max - min).abs() <= f64::EPSILON {
+        let pad = max.abs().max(1.0) * 0.01;
+        return CoordinateRange::new(min - pad, max + pad);
+    }
+    CoordinateRange::new(min, max)
+}
+
+fn rt_points(rt_rows: &[RtProfileRow]) -> Vec<(f64, f64)> {
+    rt_rows
+        .iter()
+        .map(|row| {
+            (
+                row.rt_minutes.unwrap_or(row.scan_index as f64),
+                row.summed_intensity,
+            )
+        })
+        .collect()
+}
+
+fn mz_points(mz_bins: &[MzProfileBin]) -> Vec<(f64, f64)> {
+    mz_bins
+        .iter()
+        .map(|bin| (bin.mz_center, bin.summed_intensity))
+        .collect()
+}
+
+fn mobility_points(im_rows: &[MobilityProfileRow]) -> Vec<(f64, f64)> {
+    im_rows
+        .iter()
+        .map(|row| (row.mobility, row.summed_intensity))
+        .collect()
+}
+
+fn linear_ticks(start: f64, end: f64, count: usize) -> Vec<f64> {
+    if count <= 1 {
+        return vec![start];
+    }
+    let step = (end - start) / (count - 1) as f64;
+    (0..count).map(|idx| start + step * idx as f64).collect()
+}
+
+fn output_path(prefix: &Path, suffix: &str) -> PathBuf {
+    let file_name = prefix
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("dia_slice");
+    let path = prefix
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| parent.join(format!("{file_name}.{suffix}")));
+    path.unwrap_or_else(|| PathBuf::from(format!("{file_name}.{suffix}")))
+}
+
+fn write_temp_bridge_script() -> anyhow::Result<PathBuf> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let path = env::temp_dir().join(format!(
+        "mzio-bruker-bridge-{}-{timestamp}.py",
+        std::process::id()
+    ));
+    fs::write(&path, BRUKER_BRIDGE_PY)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(path)
+}
+
+fn sanitize_tsv(value: &str) -> String {
+    value.replace('\t', " ").replace('\n', " ")
+}
+
+fn sanitize_filename_component(input: &str) -> String {
+    let mut out = String::with_capacity(input.len().min(80));
+    for ch in input.chars().take(80) {
+        match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => out.push(ch),
+            _ => out.push('_'),
+        }
+    }
+    if out.is_empty() {
+        "target".to_string()
+    } else {
+        out
+    }
+}
+
+fn format_optional_f64(value: Option<f64>, precision: usize) -> String {
+    match value {
+        Some(value) => format!("{value:.precision$}"),
+        None => String::new(),
+    }
+}
+
+fn escape_xml(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{
+        accumulate_mz_bin, compact_display_path_with, initialize_mz_bins, padded_range, parse_args,
+    };
+
+    #[test]
+    fn parse_args_rejects_mobility_flags_for_mzml() {
+        let err = parse_args(vec![
+            "--mzml".into(),
+            "demo.mzML".into(),
+            "--mz".into(),
+            "500".into(),
+            "--im-min".into(),
+            "0.7".into(),
+            "--im-max".into(),
+            "1.1".into(),
+        ])
+        .expect_err("expected mobility flags to be rejected for mzML");
+        assert!(err
+            .to_string()
+            .contains("--mzml input does not support --im-* or --quad-* yet"));
+    }
+
+    #[test]
+    fn parse_args_rejects_python_for_mzml() {
+        let err = parse_args(vec![
+            "--mzml".into(),
+            "demo.mzML".into(),
+            "--mz".into(),
+            "500".into(),
+            "--python".into(),
+            "python3".into(),
+        ])
+        .expect_err("expected --python to be rejected for mzML");
+        assert!(err
+            .to_string()
+            .contains("--python is only valid together with --bruker <run.d>"));
+    }
+
+    #[test]
+    fn initialize_and_fill_mz_bins() {
+        let mut bins = vec![
+            super::MzProfileBin {
+                mz_center: 0.0,
+                summed_intensity: 0.0,
+            };
+            3
+        ];
+        initialize_mz_bins(&mut bins, 100.0, 106.0);
+        assert!((bins[0].mz_center - 100.0).abs() < 1e-9);
+        assert!((bins[1].mz_center - 103.0).abs() < 1e-9);
+        assert!((bins[2].mz_center - 106.0).abs() < 1e-9);
+
+        accumulate_mz_bin(&mut bins, 100.0, 106.0, 105.8, 42.0);
+        assert!((bins[2].summed_intensity - 42.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn padded_range_handles_single_value() {
+        let range = padded_range([42.0].into_iter());
+        assert!(range.start < 42.0);
+        assert!(range.end > 42.0);
+    }
+
+    #[test]
+    fn parse_args_accepts_peptide_target_without_mz() {
+        let options = parse_args(vec![
+            "--mzml".into(),
+            "demo.mzML".into(),
+            "--peptide".into(),
+            "GAIIGLMVGGVVIA".into(),
+        ])
+        .expect("options parse");
+        let request = options.request.expect("request");
+        let target = request.peptide_target.expect("peptide target");
+        assert_eq!(target.sequence, "GAIIGLMVGGVVIA");
+        assert_eq!(target.charge, 2);
+        assert!((request.mz - 635.3836).abs() < 0.0001);
+        assert!((target.precursor_mz - request.mz).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_args_accepts_peptide_fragment_target_without_mz() {
+        let options = parse_args(vec![
+            "--mzml".into(),
+            "demo.mzML".into(),
+            "--peptide".into(),
+            "GAIIGLMVGGVVIA".into(),
+            "--fragment".into(),
+            "b8".into(),
+        ])
+        .expect("options parse");
+        let request = options.request.expect("request");
+        let target = request.peptide_target.expect("peptide target");
+        let fragment = target.fragment.expect("fragment target");
+        assert_eq!(fragment.label, "b8");
+        assert!((target.precursor_mz - 635.3836).abs() < 0.0001);
+        assert!((fragment.mz - 755.4484).abs() < 0.0001);
+        assert!((request.mz - fragment.mz).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_args_accepts_pseudo_ms2_for_bruker_peptide() {
+        let options = parse_args(vec![
+            "--bruker".into(),
+            "run.d".into(),
+            "--peptide".into(),
+            "GAIIGLMVGGVVIA".into(),
+            "--ms2".into(),
+            "--pseudo-ms2-rt-window".into(),
+            "0.75".into(),
+        ])
+        .expect("pseudo-ms2 options parse");
+        assert!(options.pseudo_ms2);
+        assert!((options.pseudo_ms2_rt_window_min - 0.75).abs() < 1e-9);
+        let target = options
+            .request
+            .expect("request")
+            .peptide_target
+            .expect("peptide target");
+        assert!(target.fragment.is_none());
+        assert!(target
+            .fragments
+            .iter()
+            .any(|fragment| fragment.label == "b8"));
+    }
+
+    #[test]
+    fn parse_args_rejects_pseudo_ms2_without_peptide() {
+        let err = parse_args(vec![
+            "--bruker".into(),
+            "run.d".into(),
+            "--mz".into(),
+            "500".into(),
+            "--pseudo-ms2".into(),
+        ])
+        .expect_err("pseudo-ms2 without peptide should fail");
+        assert!(err.to_string().contains("--pseudo-ms2 requires --peptide"));
+    }
+
+    #[test]
+    fn parse_args_rejects_pseudo_ms2_with_fragment() {
+        let err = parse_args(vec![
+            "--bruker".into(),
+            "run.d".into(),
+            "--peptide".into(),
+            "GAIIGLMVGGVVIA".into(),
+            "--fragment".into(),
+            "b8".into(),
+            "--pseudo-ms2".into(),
+        ])
+        .expect_err("pseudo-ms2 with a selected fragment should fail");
+        assert!(err
+            .to_string()
+            .contains("--pseudo-ms2 aggregates all peptide fragments"));
+    }
+
+    #[test]
+    fn parse_args_rejects_pseudo_ms2_for_mzml() {
+        let err = parse_args(vec![
+            "--mzml".into(),
+            "demo.mzML".into(),
+            "--peptide".into(),
+            "GAIIGLMVGGVVIA".into(),
+            "--pseudo-ms2".into(),
+        ])
+        .expect_err("pseudo-ms2 mzML mode should fail");
+        assert!(err
+            .to_string()
+            .contains("--pseudo-ms2 currently supports native Bruker .d input only"));
+    }
+
+    #[test]
+    fn parse_args_accepts_outdir_and_verbosity() {
+        let options = parse_args(vec![
+            "--mzml".into(),
+            "demo.mzML".into(),
+            "--mz".into(),
+            "500".into(),
+            "--outdir".into(),
+            "plots".into(),
+            "--verbose".into(),
+        ])
+        .expect("options parse");
+        assert_eq!(options.outdir.as_deref(), Some(Path::new("plots")));
+        assert_eq!(options.verbosity, super::Verbosity::Verbose);
+    }
+
+    #[test]
+    fn parse_args_accepts_outdir_and_out_prefix_together() {
+        let options = parse_args(vec![
+            "--mzml".into(),
+            "demo.mzML".into(),
+            "--mz".into(),
+            "500".into(),
+            "--outdir".into(),
+            "plots".into(),
+            "--out-prefix".into(),
+            "custom".into(),
+        ])
+        .expect("outdir and out-prefix should compose");
+        assert_eq!(options.outdir.as_deref(), Some(Path::new("plots")));
+        assert_eq!(options.out_prefix.as_deref(), Some(Path::new("custom")));
+    }
+
+    #[test]
+    fn parse_args_rejects_path_like_out_prefix() {
+        let err = parse_args(vec![
+            "--mzml".into(),
+            "demo.mzML".into(),
+            "--mz".into(),
+            "500".into(),
+            "--out-prefix".into(),
+            "~/Documents/".into(),
+        ])
+        .expect_err("out-prefix should reject directories");
+        assert!(err
+            .to_string()
+            .contains("--out-prefix expects a file stem/name"));
+    }
+
+    #[test]
+    fn precursor_rt_window_uses_strongest_fixed_width_region() {
+        let evidence = super::infer_precursor_rt_window_from_points(
+            &[(0.0, 1.0), (0.2, 2.0), (5.0, 10.0), (5.2, 8.0), (9.0, 7.0)],
+            500.0,
+            0.5,
+        )
+        .expect("window evidence");
+        assert_eq!(evidence.rt_window.source, "precursor-inferred");
+        assert!((evidence.rt_window.min - 5.0).abs() < 1e-9);
+        assert!((evidence.rt_window.max - 5.5).abs() < 1e-9);
+        assert_eq!(evidence.frames_with_signal, 5);
+        assert!((evidence.apex_rt.expect("apex rt") - 5.0).abs() < 1e-9);
+        assert!((evidence.apex_intensity - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_args_uses_peptide_charge_suffix_unless_overridden() {
+        let suffix = parse_args(vec![
+            "--mzml".into(),
+            "demo.mzML".into(),
+            "--peptide".into(),
+            "PEPTIDE/3".into(),
+        ])
+        .expect("suffix options")
+        .request
+        .expect("suffix request")
+        .peptide_target
+        .expect("suffix target");
+        assert_eq!(suffix.charge, 3);
+
+        let overridden = parse_args(vec![
+            "--mzml".into(),
+            "demo.mzML".into(),
+            "--peptide".into(),
+            "PEPTIDE/3".into(),
+            "--charge".into(),
+            "2".into(),
+        ])
+        .expect("override options")
+        .request
+        .expect("override request")
+        .peptide_target
+        .expect("override target");
+        assert_eq!(overridden.charge, 2);
+    }
+
+    #[test]
+    fn parse_args_rejects_mz_and_peptide_together() {
+        let err = parse_args(vec![
+            "--mzml".into(),
+            "demo.mzML".into(),
+            "--mz".into(),
+            "500".into(),
+            "--peptide".into(),
+            "PEPTIDE".into(),
+        ])
+        .expect_err("conflicting target modes should fail");
+        assert!(err
+            .to_string()
+            .contains("specify only one of --mz <center> or --peptide <SEQ>"));
+    }
+
+    #[test]
+    fn parse_args_rejects_fragment_without_peptide() {
+        let err = parse_args(vec![
+            "--mzml".into(),
+            "demo.mzML".into(),
+            "--mz".into(),
+            "500".into(),
+            "--fragment".into(),
+            "b8".into(),
+        ])
+        .expect_err("fragment without peptide should fail");
+        assert!(err.to_string().contains("--fragment requires --peptide"));
+    }
+
+    #[test]
+    fn parse_args_rejects_unknown_fragment() {
+        let err = parse_args(vec![
+            "--mzml".into(),
+            "demo.mzML".into(),
+            "--peptide".into(),
+            "GAIIGLMVGGVVIA".into(),
+            "--fragment".into(),
+            "b99".into(),
+        ])
+        .expect_err("unknown fragment should fail");
+        assert!(err.to_string().contains("unknown --fragment `b99`"));
+    }
+
+    #[test]
+    fn compact_display_path_prefers_current_directory_relative_path() {
+        let rendered = compact_display_path_with(
+            Path::new("/work/mzio/assets/demo.mzML"),
+            Some(Path::new("/work/mzio")),
+            Some(Path::new("/home/alex")),
+            80,
+        );
+        assert_eq!(rendered, "assets/demo.mzML");
+    }
+
+    #[test]
+    fn compact_display_path_collapses_long_home_path() {
+        let rendered = compact_display_path_with(
+            Path::new(
+                "/home/alex/windows/tims-ultra-0006/dshare/58087_58093/58093_1_ECL_1608_m_TMT10_prof_250ng_F01.d",
+            ),
+            Some(Path::new("/home/alex/amms06/mnt/e/MSPC001546")),
+            Some(Path::new("/home/alex")),
+            72,
+        );
+        assert!(rendered.starts_with("~/windows/tims-ultra-0006/.../"));
+        assert!(rendered.ends_with(".d"));
+        assert!(rendered.chars().count() <= 72);
+    }
+}

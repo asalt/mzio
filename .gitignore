@@ -1,0 +1,18 @@
+/target
+# Large mzML files are commonly used locally; keep them out of git by default.
+*.mzML
+*.mzml
+*.mzML.index.json
+*.mzml.index.json
+*.idx.gz*
+logs/spectra_debug.log
+exports/
+scripts/
+
+# Keep a tiny, synthetic file for demos/tests.
+!assets/demo.mzML
+
+.codex
+.codex/*
+.codex-session
+.codex-session.json

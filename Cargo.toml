@@ -1,0 +1,22 @@
+[package]
+name = "mzio"
+version = "0.1.1"
+edition = "2021"
+default-run = "mzio"
+
+[[bin]]
+name = "mzio"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+crossterm = "0.27"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+libloading = "0.8"
+mzdata = { version = "0.63.3", default-features = false, features = ["mzml"] }
+mzpeaks = "1.0.9"
+ratatui = "0.26"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+timsrust = { version = "0.4.2", default-features = false, features = ["tdf"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util", "net"] }
