@@ -129,6 +129,8 @@ fn plot_writes_annotated_svg() {
     assert!(svg.contains("class=\"ladder-index\""));
     assert!(svg.contains("Full ion table"));
     assert!(svg.contains("matched colored, missing grey; p/w/n = H3PO4/H2O/NH3"));
+    assert!(!svg.contains(">b++<"));
+    assert!(!svg.contains(">y++<"));
 
     let _ = fs::remove_file(svg_path);
 }

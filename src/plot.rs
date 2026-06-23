@@ -191,6 +191,7 @@ struct IonTableLayout {
     width: f64,
     cut_width: f64,
     pad: f64,
+    value_columns: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1692,14 +1693,25 @@ fn estimate_ion_table_layout(rows: &[IonTableRow]) -> IonTableLayout {
     let pad = 20.0;
     let cut_width = 58.0;
     let column_gap = 14.0;
-    let header_labels = ["b++", "b+", "y+", "y++"];
+    let show_charge2 = ion_table_has_charge2(rows);
+    let value_columns = if show_charge2 { 4 } else { 2 };
+    let header_labels: &[&str] = if show_charge2 {
+        &["b++", "b+", "y+", "y++"]
+    } else {
+        &["b+", "y+"]
+    };
     let mut max_value_width = header_labels
         .iter()
         .map(|label| estimate_text_width(label, ION_TABLE_HEADER_FONT))
         .fold(0.0_f64, f64::max);
 
     for row in rows {
-        for cell in [&row.b1, &row.b2, &row.y2, &row.y1] {
+        let cells: Vec<&IonTableCell> = if show_charge2 {
+            vec![&row.b1, &row.b2, &row.y2, &row.y1]
+        } else {
+            vec![&row.b1, &row.y1]
+        };
+        for cell in cells {
             max_value_width = max_value_width.max(estimate_text_width(
                 &ion_table_cell_summary_text(&cell.entries),
                 font_size,
@@ -1707,12 +1719,21 @@ fn estimate_ion_table_layout(rows: &[IonTableRow]) -> IonTableLayout {
         }
     }
 
-    let width = pad * 2.0 + cut_width + max_value_width * 4.0 + column_gap * 4.0;
+    let width = pad * 2.0
+        + cut_width
+        + max_value_width * value_columns as f64
+        + column_gap * value_columns as f64;
     IonTableLayout {
         width,
         cut_width,
         pad,
+        value_columns,
     }
+}
+
+fn ion_table_has_charge2(rows: &[IonTableRow]) -> bool {
+    rows.iter()
+        .any(|row| !row.b2.entries.is_empty() || !row.y2.entries.is_empty())
 }
 
 fn ion_table_font_size(row_count: usize) -> f64 {
@@ -1862,21 +1883,30 @@ fn draw_ion_table(
     let layout = estimate_ion_table_layout(rows);
     let pad = layout.pad;
     let cut_width = layout.cut_width;
-    let value_width = (width - pad * 2.0 - cut_width - column_gap * 4.0) / 4.0;
+    let show_charge2 = layout.value_columns == 4;
+    let value_width = (width - pad * 2.0 - cut_width - column_gap * layout.value_columns as f64)
+        / layout.value_columns as f64;
     let table_bottom = top + height;
     let title_y = top + 24.0;
     let legend_y = top + 47.0;
     let header_y = top + 76.0;
     let row_start_y = top + 104.0;
-    let b2_left = left + pad;
-    let b2_right = b2_left + value_width;
-    let b1_left = b2_right + column_gap;
-    let b1_right = b1_left + value_width;
-    let cut_left = b1_right + column_gap;
+    let mut cursor = left + pad;
+    let b2_right = if show_charge2 {
+        let right = cursor + value_width;
+        cursor = right + column_gap;
+        Some(right)
+    } else {
+        None
+    };
+    let b1_right = cursor + value_width;
+    cursor = b1_right + column_gap;
+    let cut_left = cursor;
     let cut_center = cut_left + cut_width / 2.0;
-    let y1_left = cut_left + cut_width + column_gap;
-    let y1_right = y1_left + value_width;
-    let y2_left = y1_right + column_gap;
+    cursor = cut_left + cut_width + column_gap;
+    let y1_left = cursor;
+    cursor = y1_left + value_width + column_gap;
+    let y2_left = show_charge2.then_some(cursor);
 
     writeln!(
         file,
@@ -1903,13 +1933,17 @@ fn draw_ion_table(
         fill = COLOR_SUBTLE,
     )?;
 
-    for (label, x, anchor) in [
-        ("b++", b2_right, "end"),
-        ("b+", b1_right, "end"),
-        ("cut", cut_center, "middle"),
-        ("y+", y1_left, "start"),
-        ("y++", y2_left, "start"),
-    ] {
+    let mut headers = Vec::new();
+    if let Some(x) = b2_right {
+        headers.push(("b++", x, "end"));
+    }
+    headers.push(("b+", b1_right, "end"));
+    headers.push(("cut", cut_center, "middle"));
+    headers.push(("y+", y1_left, "start"));
+    if let Some(x) = y2_left {
+        headers.push(("y++", x, "start"));
+    }
+    for (label, x, anchor) in headers {
         writeln!(
             file,
             r##"<text x="{x:.2}" y="{y:.2}" font-family="{font_family}" font-size="{font_size:.1}" fill="{fill}" text-anchor="{anchor}">{label}</text>"##,
@@ -1944,15 +1978,9 @@ fn draw_ion_table(
                 y = y - row_height / 2.0 + 2.0,
             )?;
         }
-        write_ion_table_cell(
-            file,
-            b2_right,
-            y,
-            "end",
-            font_size,
-            value_width,
-            &row.b2.entries,
-        )?;
+        if let Some(x) = b2_right {
+            write_ion_table_cell(file, x, y, "end", font_size, value_width, &row.b2.entries)?;
+        }
         write_ion_table_cell(
             file,
             b1_right,
@@ -1982,15 +2010,9 @@ fn draw_ion_table(
             value_width,
             &row.y1.entries,
         )?;
-        write_ion_table_cell(
-            file,
-            y2_left,
-            y,
-            "start",
-            font_size,
-            value_width,
-            &row.y2.entries,
-        )?;
+        if let Some(x) = y2_left {
+            write_ion_table_cell(file, x, y, "start", font_size, value_width, &row.y2.entries)?;
+        }
     }
 
     writeln!(
@@ -2535,6 +2557,19 @@ mod tests {
             .entries
             .iter()
             .any(|entry| entry.color == COLOR_SERIES_NEUTRAL));
+        assert!(ion_table_has_charge2(&rows));
+        assert_eq!(estimate_ion_table_layout(&rows).value_columns, 4);
+    }
+
+    #[test]
+    fn ion_table_hides_charge_two_columns_when_no_charge_two_fragments_exist() {
+        let context = prepare_annotation("PEPTIDEK/2", &[], &[], Some(2), MassTolerance::Ppm(20.0))
+            .expect("annotation context");
+        let report = annotate_peaks(&context, None, &[], &[]);
+        let rows = build_ion_table_rows(&report);
+
+        assert!(!ion_table_has_charge2(&rows));
+        assert_eq!(estimate_ion_table_layout(&rows).value_columns, 2);
     }
 
     #[test]
