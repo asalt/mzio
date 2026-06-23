@@ -9,6 +9,7 @@ const PHOSPHORIC_ACID_MASS: f64 = 97.976_895_573;
 const NEUTRON_MASS_DIFF: f64 = 1.003_354_835_07;
 const PHOSPHO_DELTA_MASS: f64 = 79.966_331;
 const PHOSPHO_DELTA_EPSILON: f64 = 0.01;
+const QUALITY_MAX_HEAVY_ISOTOPE: usize = 2;
 
 pub(crate) const DEFAULT_PRECURSOR_ISOTOPE_ERRORS: [u8; 3] = [0, 1, 2];
 
@@ -138,6 +139,15 @@ pub(crate) struct FragmentMatch {
     pub(crate) observed_intensity: f32,
     pub(crate) error_da: f64,
     pub(crate) error_ppm: f64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AnnotationQualityMetrics {
+    pub(crate) snr_like: f64,
+    pub(crate) log2_snr_like: f64,
+    pub(crate) cosine: f64,
+    pub(crate) frag_error_mae_ppm: Option<f64>,
+    pub(crate) frag_error_mae_da: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -285,6 +295,7 @@ pub(crate) struct AnnotationReport {
     pub(crate) fragments: Vec<FragmentIon>,
     pub(crate) matches: Vec<FragmentMatch>,
     pub(crate) precursor_check: Option<PrecursorCheck>,
+    pub(crate) quality: AnnotationQualityMetrics,
 }
 
 impl AnnotationReport {
@@ -349,6 +360,7 @@ pub(crate) fn annotate_peaks(
     let fragments =
         generate_fragments(&context.peptide, &fragment_charges, &context.neutral_losses);
     let matches = match_fragments(&fragments, mz, intensity, context.tolerance);
+    let quality = calculate_quality_metrics(&matches, mz, intensity, context.tolerance);
     let precursor_check = match (context.charge_context, observed_precursor_mz) {
         (Some(charge), Some(observed_mz)) if charge > 0 => context
             .peptide
@@ -403,7 +415,109 @@ pub(crate) fn annotate_peaks(
         fragments,
         matches,
         precursor_check,
+        quality,
     }
+}
+
+fn calculate_quality_metrics(
+    matches: &[FragmentMatch],
+    mz: &[f64],
+    intensity: &[f32],
+    tolerance: MassTolerance,
+) -> AnnotationQualityMetrics {
+    const LOG_RATIO_EPSILON: f64 = 1.0;
+
+    let observed = sorted_observed_peaks(mz, intensity);
+    let mut matched_peak_indices = matches
+        .iter()
+        .map(|matched| matched.peak_index)
+        .collect::<Vec<_>>();
+
+    for matched in matches {
+        if !should_integrate_fragment_isotopes(&matched.fragment, tolerance) {
+            continue;
+        }
+        let isotope_spacing = NEUTRON_MASS_DIFF / matched.fragment.charge as f64;
+        for isotope_order in 1..=QUALITY_MAX_HEAVY_ISOTOPE {
+            let target_mz =
+                matched.fragment.theoretical_mz + isotope_order as f64 * isotope_spacing;
+            if let Some(peak) = best_peak_for_target(&observed, target_mz, tolerance) {
+                matched_peak_indices.push(peak.index);
+            }
+        }
+    }
+
+    matched_peak_indices.sort_unstable();
+    matched_peak_indices.dedup();
+
+    let mut matched_intensity = 0.0;
+    let mut unmatched_intensity = 0.0;
+    let mut matched_sum_squares = 0.0;
+    let mut observed_sum_squares = 0.0;
+
+    for (idx, value) in intensity.iter().copied().enumerate() {
+        if !value.is_finite() {
+            continue;
+        }
+        let value = (value as f64).max(0.0);
+        observed_sum_squares += value * value;
+        if matched_peak_indices.binary_search(&idx).is_ok() {
+            matched_intensity += value;
+            matched_sum_squares += value * value;
+        } else {
+            unmatched_intensity += value;
+        }
+    }
+
+    let snr_like = if unmatched_intensity > 0.0 {
+        matched_intensity / unmatched_intensity
+    } else if matched_intensity > 0.0 {
+        f64::INFINITY
+    } else {
+        0.0
+    };
+    let log2_snr_like = ((matched_intensity + LOG_RATIO_EPSILON)
+        / (unmatched_intensity + LOG_RATIO_EPSILON))
+        .log2();
+    let cosine_denominator = matched_sum_squares.sqrt() * observed_sum_squares.sqrt();
+    let cosine = if cosine_denominator > 0.0 {
+        (matched_sum_squares / cosine_denominator).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let (frag_error_mae_ppm, frag_error_mae_da) = if matches.is_empty() {
+        (None, None)
+    } else {
+        (
+            Some(
+                matches
+                    .iter()
+                    .map(|matched| matched.error_ppm.abs())
+                    .sum::<f64>()
+                    / matches.len() as f64,
+            ),
+            Some(
+                matches
+                    .iter()
+                    .map(|matched| matched.error_da.abs())
+                    .sum::<f64>()
+                    / matches.len() as f64,
+            ),
+        )
+    };
+
+    AnnotationQualityMetrics {
+        snr_like,
+        log2_snr_like,
+        cosine,
+        frag_error_mae_ppm,
+        frag_error_mae_da,
+    }
+}
+
+fn should_integrate_fragment_isotopes(fragment: &FragmentIon, tolerance: MassTolerance) -> bool {
+    let isotope_spacing = NEUTRON_MASS_DIFF / fragment.charge as f64;
+    isotope_spacing > 2.0 * tolerance.window_da(fragment.theoretical_mz)
 }
 
 pub(crate) fn fragment_charge_states(charge_context: Option<i32>) -> Vec<u8> {
@@ -722,63 +836,11 @@ fn match_fragments(
     intensity: &[f32],
     tolerance: MassTolerance,
 ) -> Vec<FragmentMatch> {
-    let mut observed = mz
-        .iter()
-        .copied()
-        .zip(intensity.iter().copied())
-        .enumerate()
-        .filter_map(|(index, (mz, intensity))| {
-            if mz.is_finite() && intensity.is_finite() {
-                Some(ObservedPeak {
-                    index,
-                    mz,
-                    intensity,
-                })
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-    observed.sort_by(|left, right| left.mz.partial_cmp(&right.mz).unwrap_or(Ordering::Equal));
+    let observed = sorted_observed_peaks(mz, intensity);
 
     let mut out = Vec::new();
     for fragment in fragments {
-        let tolerance_da = tolerance.window_da(fragment.theoretical_mz);
-        let insertion = observed.partition_point(|peak| peak.mz < fragment.theoretical_mz);
-        let mut best: Option<&ObservedPeak> = None;
-
-        let mut left = insertion;
-        while left > 0 {
-            left -= 1;
-            let candidate = &observed[left];
-            let error_da = (candidate.mz - fragment.theoretical_mz).abs();
-            if error_da > tolerance_da && candidate.mz < fragment.theoretical_mz {
-                break;
-            }
-            if !tolerance.contains(fragment.theoretical_mz, candidate.mz) {
-                continue;
-            }
-            if is_better_peak(candidate, best, fragment.theoretical_mz) {
-                best = Some(candidate);
-            }
-        }
-
-        let mut right = insertion;
-        while right < observed.len() {
-            let candidate = &observed[right];
-            let error_da = (candidate.mz - fragment.theoretical_mz).abs();
-            if error_da > tolerance_da && candidate.mz > fragment.theoretical_mz {
-                break;
-            }
-            if tolerance.contains(fragment.theoretical_mz, candidate.mz)
-                && is_better_peak(candidate, best, fragment.theoretical_mz)
-            {
-                best = Some(candidate);
-            }
-            right += 1;
-        }
-
-        if let Some(peak) = best {
+        if let Some(peak) = best_peak_for_target(&observed, fragment.theoretical_mz, tolerance) {
             let error_da = peak.mz - fragment.theoretical_mz;
             out.push(FragmentMatch {
                 fragment: fragment.clone(),
@@ -809,6 +871,71 @@ fn match_fragments(
             })
     });
     out
+}
+
+fn sorted_observed_peaks(mz: &[f64], intensity: &[f32]) -> Vec<ObservedPeak> {
+    let mut observed = mz
+        .iter()
+        .copied()
+        .zip(intensity.iter().copied())
+        .enumerate()
+        .filter_map(|(index, (mz, intensity))| {
+            if mz.is_finite() && intensity.is_finite() {
+                Some(ObservedPeak {
+                    index,
+                    mz,
+                    intensity,
+                })
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    observed.sort_by(|left, right| left.mz.partial_cmp(&right.mz).unwrap_or(Ordering::Equal));
+    observed
+}
+
+fn best_peak_for_target(
+    observed: &[ObservedPeak],
+    theoretical_mz: f64,
+    tolerance: MassTolerance,
+) -> Option<&ObservedPeak> {
+    let tolerance_da = tolerance.window_da(theoretical_mz);
+    let insertion = observed.partition_point(|peak| peak.mz < theoretical_mz);
+    let mut best: Option<&ObservedPeak> = None;
+
+    let mut left = insertion;
+    while left > 0 {
+        left -= 1;
+        let candidate = &observed[left];
+        let error_da = (candidate.mz - theoretical_mz).abs();
+        if error_da > tolerance_da && candidate.mz < theoretical_mz {
+            break;
+        }
+        if !tolerance.contains(theoretical_mz, candidate.mz) {
+            continue;
+        }
+        if is_better_peak(candidate, best, theoretical_mz) {
+            best = Some(candidate);
+        }
+    }
+
+    let mut right = insertion;
+    while right < observed.len() {
+        let candidate = &observed[right];
+        let error_da = (candidate.mz - theoretical_mz).abs();
+        if error_da > tolerance_da && candidate.mz > theoretical_mz {
+            break;
+        }
+        if tolerance.contains(theoretical_mz, candidate.mz)
+            && is_better_peak(candidate, best, theoretical_mz)
+        {
+            best = Some(candidate);
+        }
+        right += 1;
+    }
+
+    best
 }
 
 fn is_better_peak<'a>(
@@ -1043,6 +1170,95 @@ mod tests {
                 && matched.fragment.ordinal == 1
                 && (matched.error_da - 0.01).abs() < 1e-6
         }));
+    }
+
+    #[test]
+    fn annotation_quality_metrics_use_unique_matched_peaks() {
+        let context = prepare_annotation("PEP", &[], &[], Some(1), MassTolerance::Da(0.02))
+            .expect("annotation context");
+        let fragments = generate_fragments(&context.peptide, &[1], &[]);
+        let target = fragments
+            .iter()
+            .find(|fragment| fragment.series == FragmentSeries::Y && fragment.ordinal == 1)
+            .expect("y1 fragment")
+            .theoretical_mz;
+        let mz = [target + 0.01, target + NEUTRON_MASS_DIFF + 0.01, 1000.0];
+        let intensity = [100.0, 25.0, 50.0];
+        let report = annotate_peaks(&context, None, &mz, &intensity);
+
+        assert_eq!(report.matched_peak_count(), 1);
+        assert!((report.quality.snr_like - 2.5).abs() < 1e-9);
+        assert!((report.quality.log2_snr_like - (126.0_f64 / 51.0).log2()).abs() < 1e-9);
+        let matched_sum_squares = 100.0_f64 * 100.0 + 25.0 * 25.0;
+        let observed_sum_squares = matched_sum_squares + 50.0 * 50.0;
+        assert!(
+            (report.quality.cosine
+                - (matched_sum_squares
+                    / (matched_sum_squares.sqrt() * observed_sum_squares.sqrt())))
+            .abs()
+                < 1e-9
+        );
+        assert!(
+            report
+                .quality
+                .frag_error_mae_ppm
+                .expect("fragment error mae")
+                > 0.0
+        );
+    }
+
+    #[test]
+    fn annotation_quality_skips_isotopes_when_spacing_is_not_two_tolerances() {
+        let context = prepare_annotation("PEP/3", &[], &[], Some(3), MassTolerance::Da(0.5))
+            .expect("annotation context");
+        let fragments = generate_fragments(&context.peptide, &[1, 2], &[]);
+        let target = fragments
+            .iter()
+            .find(|fragment| {
+                fragment.series == FragmentSeries::Y
+                    && fragment.ordinal == 1
+                    && fragment.charge == 2
+            })
+            .expect("y1++ fragment")
+            .theoretical_mz;
+        let mz = [
+            target + 0.01,
+            target + NEUTRON_MASS_DIFF / 2.0 + 0.01,
+            1000.0,
+        ];
+        let intensity = [100.0, 25.0, 50.0];
+        let report = annotate_peaks(&context, None, &mz, &intensity);
+
+        assert_eq!(report.matched_peak_count(), 1);
+        assert!((report.quality.snr_like - (100.0_f64 / 75.0)).abs() < 1e-9);
+        assert!((report.quality.log2_snr_like - (101.0_f64 / 76.0).log2()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fragment_isotope_gate_requires_spacing_above_two_tolerances() {
+        let base = FragmentIon {
+            series: FragmentSeries::Y,
+            ordinal: 1,
+            cleavage_index: 1,
+            charge: 2,
+            neutral_loss: None,
+            theoretical_mz: 500.0,
+        };
+        assert!(should_integrate_fragment_isotopes(
+            &base,
+            MassTolerance::Da(0.25)
+        ));
+        assert!(!should_integrate_fragment_isotopes(
+            &base,
+            MassTolerance::Da(0.5)
+        ));
+
+        let mut charge_three = base.clone();
+        charge_three.charge = 3;
+        assert!(!should_integrate_fragment_isotopes(
+            &charge_three,
+            MassTolerance::Da(0.25)
+        ));
     }
 
     #[test]

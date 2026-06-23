@@ -113,15 +113,59 @@ fn plot_writes_annotated_svg() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Quality: SNR="));
+    assert!(stdout.contains("log2_SNR="));
+    assert!(stdout.contains("frag_error_mae_ppm="));
 
     let svg = fs::read_to_string(&svg_path).expect("read svg");
     assert!(svg.contains("Matched fragment ladder"));
     assert!(svg.contains("Source: demo.mzML"));
     assert!(svg.contains("Peptide: PEPTIDEK"));
     assert!(svg.contains("tolerance: 20.0 ppm"));
+    assert!(svg.contains("Quality: SNR="));
+    assert!(svg.contains("log2_SNR="));
+    assert!(svg.contains("frag_error_mae_ppm="));
     assert!(svg.contains("class=\"ladder-index\""));
     assert!(svg.contains("Full ion table"));
     assert!(svg.contains("matched colored, missing grey; p/w/n = H3PO4/H2O/NH3"));
+
+    let _ = fs::remove_file(svg_path);
+}
+
+#[test]
+fn plot_reports_fragment_error_in_da_for_wide_da_tolerance() {
+    let svg_path = unique_svg_path("annotated-da-error");
+    let output = Command::new(binary_path())
+        .args([
+            "plot",
+            "--mzml",
+            demo_mzml_path().to_str().expect("demo mzml path"),
+            "--id",
+            "scan=2",
+            "--peptide",
+            "PEPTIDEK/2",
+            "--tol-da",
+            "0.5",
+            "--svg",
+            svg_path.to_str().expect("svg path"),
+        ])
+        .output()
+        .expect("run annotated plot with Da tolerance");
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\n\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("frag_error_mae_da="));
+    assert!(!stdout.contains("frag_error_mae_ppm="));
+
+    let svg = fs::read_to_string(&svg_path).expect("read svg");
+    assert!(svg.contains("frag_error_mae_da="));
+    assert!(!svg.contains("frag_error_mae_ppm="));
 
     let _ = fs::remove_file(svg_path);
 }

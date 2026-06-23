@@ -10,8 +10,8 @@ use anyhow::Context;
 use mzdata::spectrum::SignalContinuity;
 
 use crate::annotate::{
-    annotate_peaks, prepare_annotation, AnnotationContext, AnnotationReport, FragmentIon,
-    FragmentMatch, FragmentSeries, MassTolerance, NeutralLossKind,
+    annotate_peaks, prepare_annotation, AnnotationContext, AnnotationQualityMetrics,
+    AnnotationReport, FragmentIon, FragmentMatch, FragmentSeries, MassTolerance, NeutralLossKind,
     DEFAULT_PRECURSOR_ISOTOPE_ERRORS,
 };
 use crate::ms2::load_selected_spectrum as load_selected_ms2_spectrum;
@@ -357,6 +357,10 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
                 report.matches.len(),
                 report.matched_peak_count(),
                 context.tolerance.label(),
+            );
+            println!(
+                "Quality: {}",
+                format_quality_metrics(&report.quality, context.tolerance)
             );
             if let Some(check) = report.precursor_check.as_ref() {
                 if check.isotope_error == 0 {
@@ -746,6 +750,30 @@ fn format_precursor(precursor_mz: Option<f64>, precursor_charge: Option<i32>) ->
         (Some(mz), None) => format!("{mz:.4}"),
         (None, Some(charge)) => format!("? ({charge}+)"),
         (None, None) => "-".to_string(),
+    }
+}
+
+fn format_quality_metrics(metrics: &AnnotationQualityMetrics, tolerance: MassTolerance) -> String {
+    let frag_error = format_fragment_error_mae(metrics, tolerance);
+    format!(
+        "SNR={:.3} | log2_SNR={:.3} | cosine={:.3} | {}",
+        metrics.snr_like, metrics.log2_snr_like, metrics.cosine, frag_error
+    )
+}
+
+fn format_fragment_error_mae(
+    metrics: &AnnotationQualityMetrics,
+    tolerance: MassTolerance,
+) -> String {
+    match tolerance {
+        MassTolerance::Da(da) if da >= 0.25 => metrics
+            .frag_error_mae_da
+            .map(|value| format!("frag_error_mae_da={value:.4}"))
+            .unwrap_or_else(|| "frag_error_mae_da=NA".to_string()),
+        _ => metrics
+            .frag_error_mae_ppm
+            .map(|value| format!("frag_error_mae_ppm={value:.2}"))
+            .unwrap_or_else(|| "frag_error_mae_ppm=NA".to_string()),
     }
 }
 
@@ -1368,6 +1396,17 @@ fn build_header_lines(
             size: PLOT_HEADER_DETAIL_FONT,
             color: COLOR_TEXT,
         });
+
+        if let Some(report) = annotation_report {
+            lines.push(SvgHeaderLine {
+                text: format!(
+                    "Quality: {}",
+                    format_quality_metrics(&report.quality, context.tolerance)
+                ),
+                size: PLOT_HEADER_META_FONT,
+                color: COLOR_SUBTLE,
+            });
+        }
 
         if let Some(mod_label) = context.modifications_label() {
             lines.push(SvgHeaderLine {
