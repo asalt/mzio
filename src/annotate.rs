@@ -50,6 +50,7 @@ impl MassTolerance {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ModificationSite {
     NTerm,
+    CTerm,
     Residue(usize),
 }
 
@@ -63,6 +64,7 @@ impl ExplicitModification {
     pub(crate) fn label(&self) -> String {
         match self.site {
             ModificationSite::NTerm => format!("n-term:{:+.6}", self.delta),
+            ModificationSite::CTerm => format!("c-term:{:+.6}", self.delta),
             ModificationSite::Residue(position) => format!("{position}:{:+.6}", self.delta),
         }
     }
@@ -169,6 +171,7 @@ pub(crate) struct Peptide {
     residue_deltas: Vec<f64>,
     residue_masses: Vec<f64>,
     n_term_delta: f64,
+    c_term_delta: f64,
     charge_hint: Option<i32>,
 }
 
@@ -190,7 +193,7 @@ impl Peptide {
     }
 
     pub(crate) fn neutral_mass(&self) -> f64 {
-        self.total_residue_mass() + self.n_term_delta + WATER_MASS
+        self.total_residue_mass() + self.n_term_delta + self.c_term_delta + WATER_MASS
     }
 
     pub(crate) fn precursor_mz(&self, charge: i32) -> Option<f64> {
@@ -262,10 +265,14 @@ impl AnnotationContext {
     pub(crate) fn modified_sequence(&self) -> String {
         let mut residue_mods = vec![Vec::<String>::new(); self.peptide.len()];
         let mut n_term_mods = Vec::<String>::new();
+        let mut c_term_mods = Vec::<String>::new();
         for modification in &self.modifications {
             match modification.site {
                 ModificationSite::NTerm => {
                     n_term_mods.push(format!("[{:+.6}]", modification.delta))
+                }
+                ModificationSite::CTerm => {
+                    c_term_mods.push(format!("[{:+.6}]", modification.delta))
                 }
                 ModificationSite::Residue(position) => {
                     if position > 0 && position <= residue_mods.len() {
@@ -284,6 +291,9 @@ impl AnnotationContext {
             for value in &residue_mods[idx] {
                 out.push_str(value);
             }
+        }
+        for value in c_term_mods {
+            out.push_str(&value);
         }
         out
     }
@@ -338,7 +348,45 @@ pub(crate) fn prepare_annotation(
     for raw in mod_inputs {
         modifications.push(parse_mod_spec(raw)?);
     }
-    let peptide = build_peptide(&parsed.sequence, parsed.charge_hint, &modifications)?;
+    prepare_annotation_from_parts(
+        parsed.sequence,
+        parsed.charge_hint,
+        modifications,
+        neutral_losses,
+        preferred_charge_context,
+        tolerance,
+    )
+}
+
+pub(crate) fn prepare_annotation_with_modifications(
+    peptide_input: &str,
+    explicit_modifications: Vec<ExplicitModification>,
+    neutral_losses: &[NeutralLossKind],
+    preferred_charge_context: Option<i32>,
+    tolerance: MassTolerance,
+) -> anyhow::Result<AnnotationContext> {
+    let parsed = parse_peptide_input(peptide_input)?;
+    let mut modifications = parsed.inline_modifications;
+    modifications.extend(explicit_modifications);
+    prepare_annotation_from_parts(
+        parsed.sequence,
+        parsed.charge_hint,
+        modifications,
+        neutral_losses,
+        preferred_charge_context,
+        tolerance,
+    )
+}
+
+fn prepare_annotation_from_parts(
+    sequence: String,
+    charge_hint: Option<i32>,
+    modifications: Vec<ExplicitModification>,
+    neutral_losses: &[NeutralLossKind],
+    preferred_charge_context: Option<i32>,
+    tolerance: MassTolerance,
+) -> anyhow::Result<AnnotationContext> {
+    let peptide = build_peptide(&sequence, charge_hint, &modifications)?;
     let charge_context = preferred_charge_context.or(peptide.charge_hint());
     Ok(AnnotationContext {
         peptide,
@@ -623,10 +671,14 @@ fn build_peptide(
 
     let mut delta_by_position = vec![0.0_f64; residue_chars.len()];
     let mut n_term_delta = 0.0_f64;
+    let mut c_term_delta = 0.0_f64;
     for modification in modifications {
         match modification.site {
             ModificationSite::NTerm => {
                 n_term_delta += modification.delta;
+            }
+            ModificationSite::CTerm => {
+                c_term_delta += modification.delta;
             }
             ModificationSite::Residue(position) => {
                 if position == 0 || position > residue_chars.len() {
@@ -654,6 +706,7 @@ fn build_peptide(
         residue_deltas: delta_by_position,
         residue_masses,
         n_term_delta,
+        c_term_delta,
         charge_hint,
     })
 }
@@ -678,7 +731,7 @@ fn parse_inline_delta(input: &str, start_idx: usize) -> anyhow::Result<(f64, usi
     Ok((delta, start_idx + end_rel + 2))
 }
 
-fn residue_mass(aa: char) -> Option<f64> {
+pub(crate) fn residue_mass(aa: char) -> Option<f64> {
     match aa {
         'A' => Some(71.037_113_805),
         'R' => Some(156.101_111_05),
@@ -699,6 +752,7 @@ fn residue_mass(aa: char) -> Option<f64> {
         'T' => Some(101.047_678_505),
         'W' => Some(186.079_312_98),
         'Y' => Some(163.063_328_575),
+        'U' => Some(150.953_633_405),
         'V' => Some(99.068_413_945),
         _ => None,
     }
@@ -728,7 +782,7 @@ pub(crate) fn generate_fragments(
         let b_residues = &peptide.residue_chars[..cleavage_index];
         let b_residue_deltas = &peptide.residue_deltas[..cleavage_index];
         let y_ordinal = peptide.len() - cleavage_index;
-        let y_residue_mass = total_residue_mass - prefix_residue_mass;
+        let y_residue_mass = total_residue_mass - prefix_residue_mass + peptide.c_term_delta;
         let y_residues = &peptide.residue_chars[cleavage_index..];
         let y_residue_deltas = &peptide.residue_deltas[cleavage_index..];
         push_fragment_variants(
@@ -1054,6 +1108,41 @@ mod tests {
             context.modifications_label().as_deref(),
             Some("n-term:+42.010600")
         );
+    }
+
+    #[test]
+    fn explicit_c_term_shift_changes_precursor_and_y_ions() {
+        let plain = prepare_annotation("PEPUK/2", &[], &[], Some(2), MassTolerance::Ppm(20.0))
+            .expect("plain annotation");
+        let shifted = prepare_annotation_with_modifications(
+            "PEPUK",
+            vec![ExplicitModification {
+                site: ModificationSite::CTerm,
+                delta: 17.003,
+            }],
+            &[],
+            Some(2),
+            MassTolerance::Ppm(20.0),
+        )
+        .expect("shifted annotation");
+
+        assert_eq!(shifted.peptide.sequence(), "PEPUK");
+        assert_eq!(shifted.charge_context, Some(2));
+        assert_eq!(shifted.modified_sequence(), "PEPUK[+17.003000]");
+
+        let plain_precursor = plain.peptide.precursor_mz(2).expect("plain precursor");
+        let shifted_precursor = shifted.peptide.precursor_mz(2).expect("shifted precursor");
+        assert!((shifted_precursor - plain_precursor - 17.003 / 2.0).abs() < 1e-9);
+
+        let plain_y1 = generate_fragments(&plain.peptide, &[1], &[])
+            .into_iter()
+            .find(|fragment| fragment.series == FragmentSeries::Y && fragment.ordinal == 1)
+            .expect("plain y1");
+        let shifted_y1 = generate_fragments(&shifted.peptide, &[1], &[])
+            .into_iter()
+            .find(|fragment| fragment.series == FragmentSeries::Y && fragment.ordinal == 1)
+            .expect("shifted y1");
+        assert!((shifted_y1.theoretical_mz - plain_y1.theoretical_mz - 17.003).abs() < 1e-9);
     }
 
     #[test]

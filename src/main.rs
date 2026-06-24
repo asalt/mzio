@@ -3,6 +3,7 @@ mod dia;
 mod diagnostics;
 mod ms2;
 mod mzml;
+mod pepxml;
 mod plot;
 mod scale;
 mod scan;

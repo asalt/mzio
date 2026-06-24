@@ -634,6 +634,7 @@ dependencies = [
  "libloading",
  "mzdata",
  "mzpeaks",
+ "quick-xml",
  "ratatui",
  "serde",
  "serde_json",

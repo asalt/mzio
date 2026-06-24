@@ -8,17 +8,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use mzdata::spectrum::SignalContinuity;
+use serde::Serialize;
 
 use crate::annotate::{
-    annotate_peaks, prepare_annotation, AnnotationContext, AnnotationQualityMetrics,
-    AnnotationReport, FragmentIon, FragmentMatch, FragmentSeries, MassTolerance, NeutralLossKind,
-    DEFAULT_PRECURSOR_ISOTOPE_ERRORS,
+    annotate_peaks, prepare_annotation, prepare_annotation_with_modifications, AnnotationContext,
+    AnnotationQualityMetrics, AnnotationReport, FragmentIon, FragmentMatch, FragmentSeries,
+    MassTolerance, NeutralLossKind, PrecursorCheck, DEFAULT_PRECURSOR_ISOTOPE_ERRORS,
 };
 use crate::ms2::load_selected_spectrum as load_selected_ms2_spectrum;
 use crate::mzml::{
     extract_scan_number, load_selected_spectrum as load_selected_mzml_spectrum, open_reader,
     LoadedSpectrum, SpectrumSelector,
 };
+use crate::pepxml::{load_hits_for_scan, PepXmlHit, PepXmlModification, PepXmlScore};
 use crate::scale::CoordinateRange;
 use crate::svg_canvas::{AxisOrientation, AxisProps, AxisTickLabelStyle, SvgCanvas};
 
@@ -88,6 +90,9 @@ struct PlotOptions {
     svg_path: Option<PathBuf>,
     svg_prefix: Option<String>,
     peptide_input: Option<String>,
+    pepxml_path: Option<PathBuf>,
+    top_n: usize,
+    top_n_explicit: bool,
     mod_inputs: Vec<String>,
     neutral_losses_enabled: bool,
     neutral_loss_label_min_frac: f64,
@@ -112,6 +117,9 @@ impl Default for PlotOptions {
             svg_path: None,
             svg_prefix: None,
             peptide_input: None,
+            pepxml_path: None,
+            top_n: 1,
+            top_n_explicit: false,
             mod_inputs: Vec::new(),
             neutral_losses_enabled: false,
             neutral_loss_label_min_frac: DEFAULT_NEUTRAL_LOSS_LABEL_MIN_FRAC,
@@ -202,6 +210,86 @@ struct IonKey {
     neutral_loss: Option<NeutralLossKind>,
 }
 
+#[derive(Clone, Debug)]
+struct PlotPreparedData {
+    render_mode: PlotRenderMode,
+    bounds: CoordinateRange<f64>,
+    y_max: f64,
+    points: Vec<(f64, f64)>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct PsmPlotJson {
+    mzml: String,
+    pepxml: String,
+    svg: String,
+    scan: PsmScanJson,
+    psm: PsmHitJson,
+    annotation: PsmAnnotationJson,
+    quality: Option<PsmQualityJson>,
+    precursor_check: Option<PsmPrecursorCheckJson>,
+    warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct PsmScanJson {
+    scan_id: String,
+    index: u32,
+    ms_level: u8,
+    rt_minutes: Option<f64>,
+    precursor_mz: Option<f64>,
+    precursor_charge: Option<i32>,
+    points: usize,
+    base_peak_mz: f64,
+    base_peak_intensity: f32,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct PsmHitJson {
+    rank: usize,
+    peptide: String,
+    assumed_charge: Option<i32>,
+    spectrum: Option<String>,
+    start_scan: Option<u64>,
+    end_scan: Option<u64>,
+    protein: Option<String>,
+    calc_neutral_pep_mass: Option<f64>,
+    massdiff: Option<f64>,
+    scores: Vec<PepXmlScore>,
+    modifications: Vec<PepXmlModification>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct PsmAnnotationJson {
+    modified_sequence: String,
+    charge_context: Option<i32>,
+    tolerance: String,
+    theoretical_ions: usize,
+    matches: usize,
+    matched_observed_peaks: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct PsmQualityJson {
+    snr: f64,
+    log2_snr: f64,
+    cosine: f64,
+    frag_error_mae_ppm: Option<f64>,
+    frag_error_mae_da: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct PsmPrecursorCheckJson {
+    charge: i32,
+    monoisotopic_theoretical_mz: f64,
+    theoretical_mz: f64,
+    observed_mz: f64,
+    isotope_error: u8,
+    error_da: f64,
+    error_ppm: f64,
+    within_tolerance: bool,
+}
+
 pub fn run(args: Vec<String>) -> anyhow::Result<()> {
     if args
         .iter()
@@ -233,28 +321,27 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
             load_selected_ms2_spectrum(input_path.as_path(), options.selector.as_ref())?
         }
     };
-    let render_mode = resolve_plot_mode(options.mode, spectrum.meta.continuity, spectrum.mz.len());
-    let bounds = resolve_bounds(&spectrum, options.mz_min, options.mz_max);
-    let precursor_exclusion_window = if options.remove_precursor {
-        precursor_exclusion_window(spectrum.meta.precursor_mz)
-    } else {
-        None
-    };
-    let (points, y_max) = downsample_max_per_bin(
-        &spectrum.mz,
-        &spectrum.intensity,
-        bounds,
-        options.normalize,
-        precursor_exclusion_window,
-        SVG_BINS,
-    );
-
+    let prepared = prepare_plot_data(&spectrum, &options);
     let display_charge = options.charge_override.or(spectrum.meta.precursor_charge);
     let neutral_losses = if options.neutral_losses_enabled {
         COMMON_NEUTRAL_LOSSES.as_slice()
     } else {
         &[]
     };
+
+    if let Some(pepxml_path) = options.pepxml_path.as_ref() {
+        run_pepxml_plot(
+            &options,
+            input_path,
+            pepxml_path,
+            &spectrum,
+            &prepared,
+            display_charge,
+            neutral_losses,
+        )?;
+        return Ok(());
+    }
+
     let annotation_context = if let Some(peptide_input) = options.peptide_input.as_deref() {
         let mut context = prepare_annotation(
             peptide_input,
@@ -313,33 +400,249 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
             options.svg_prefix.as_deref(),
         )
     });
-    if let Some(parent) = svg_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-    }
-
-    write_spectrum_svg(
+    write_plot_svg(
         &svg_path,
         input_path,
-        SVG_WIDTH,
-        SVG_HEIGHT,
         &spectrum,
-        render_mode,
-        bounds,
-        y_max,
-        &points,
-        options.normalize,
+        &prepared,
+        &options,
         display_charge,
-        !options.remove_precursor,
-        options.neutral_loss_label_min_frac,
         annotation_context.as_ref(),
         annotation_report.as_ref(),
         &warnings,
     )?;
 
     println!("Wrote SVG: {}", svg_path.display());
+    print_plot_summary(
+        &spectrum,
+        display_charge,
+        annotation_context.as_ref(),
+        annotation_report.as_ref(),
+        &warnings,
+    );
+
+    Ok(())
+}
+
+fn prepare_plot_data(spectrum: &LoadedSpectrum, options: &PlotOptions) -> PlotPreparedData {
+    let render_mode = resolve_plot_mode(options.mode, spectrum.meta.continuity, spectrum.mz.len());
+    let bounds = resolve_bounds(spectrum, options.mz_min, options.mz_max);
+    let precursor_exclusion_window = if options.remove_precursor {
+        precursor_exclusion_window(spectrum.meta.precursor_mz)
+    } else {
+        None
+    };
+    let (points, y_max) = downsample_max_per_bin(
+        &spectrum.mz,
+        &spectrum.intensity,
+        bounds,
+        options.normalize,
+        precursor_exclusion_window,
+        SVG_BINS,
+    );
+    PlotPreparedData {
+        render_mode,
+        bounds,
+        y_max,
+        points,
+    }
+}
+
+fn run_pepxml_plot(
+    options: &PlotOptions,
+    input_path: &Path,
+    pepxml_path: &Path,
+    spectrum: &LoadedSpectrum,
+    prepared: &PlotPreparedData,
+    display_charge: Option<i32>,
+    neutral_losses: &[NeutralLossKind],
+) -> anyhow::Result<()> {
+    let scan_number = resolve_pepxml_scan_number(spectrum, options.selector.as_ref())?;
+    let scan_hits = load_hits_for_scan(pepxml_path, scan_number, options.top_n)?;
+    if scan_hits.available_hits == 0 {
+        anyhow::bail!(
+            "no pepXML search hits found for scan {} in {}",
+            scan_number,
+            pepxml_path.display()
+        );
+    }
+    if scan_hits.requested_top_n > scan_hits.available_hits {
+        eprintln!(
+            "warning: requested --top-n {} but pepXML has {} hit(s) for scan {}; plotting available hit(s)",
+            scan_hits.requested_top_n, scan_hits.available_hits, scan_number
+        );
+    }
+    if options.svg_path.is_some() && scan_hits.hits.len() > 1 {
+        anyhow::bail!("--svg can be used with only one pepXML hit; omit --svg or reduce --top-n");
+    }
+
+    for hit in &scan_hits.hits {
+        let mut context = prepare_annotation_with_modifications(
+            &hit.peptide,
+            hit.explicit_modifications(),
+            neutral_losses,
+            options
+                .charge_override
+                .or(hit.assumed_charge)
+                .or(display_charge),
+            options.tolerance,
+        )?;
+        context.isotope_errors = options.isotope_errors.clone();
+
+        let mut warnings = Vec::<String>::new();
+        let annotation_report = build_annotation_report(spectrum, &context, &mut warnings);
+        let svg_path = options.svg_path.clone().unwrap_or_else(|| {
+            default_pepxml_output_path(
+                input_path,
+                spectrum,
+                &context,
+                display_charge.or(context.charge_context),
+                options.neutral_losses_enabled,
+                options.svg_prefix.as_deref(),
+                hit,
+            )
+        });
+        write_plot_svg(
+            &svg_path,
+            input_path,
+            spectrum,
+            prepared,
+            options,
+            display_charge.or(context.charge_context),
+            Some(&context),
+            annotation_report.as_ref(),
+            &warnings,
+        )?;
+        let json_path = svg_path.with_extension("json");
+        write_psm_json(
+            &json_path,
+            input_path,
+            pepxml_path,
+            &svg_path,
+            spectrum,
+            hit,
+            &context,
+            annotation_report.as_ref(),
+            &warnings,
+        )?;
+
+        println!("Wrote SVG: {}", svg_path.display());
+        println!("Wrote JSON: {}", json_path.display());
+        println!(
+            "pepXML hit rank {} | peptide {} | charge {}",
+            hit.hit_rank,
+            context.modified_sequence(),
+            context
+                .charge_context
+                .map(|charge| format!("{charge}+"))
+                .unwrap_or_else(|| "-".to_string())
+        );
+        print_plot_summary(
+            spectrum,
+            display_charge.or(context.charge_context),
+            Some(&context),
+            annotation_report.as_ref(),
+            &warnings,
+        );
+    }
+
+    Ok(())
+}
+
+fn resolve_pepxml_scan_number(
+    spectrum: &LoadedSpectrum,
+    selector: Option<&SpectrumSelector>,
+) -> anyhow::Result<u64> {
+    if let Some(scan) = extract_scan_number(&spectrum.meta.scan_id) {
+        return Ok(scan);
+    }
+    if let Some(SpectrumSelector::ScanNumber(scan)) = selector {
+        return Ok(*scan);
+    }
+    anyhow::bail!(
+        "pepXML annotation requires a scan number; use --scan or an mzML native id containing scan=<n>"
+    )
+}
+
+fn build_annotation_report(
+    spectrum: &LoadedSpectrum,
+    context: &AnnotationContext,
+    warnings: &mut Vec<String>,
+) -> Option<AnnotationReport> {
+    if matches!(spectrum.meta.continuity, SignalContinuity::Profile) {
+        warnings.push(
+            "Fragment annotation skipped because this spectrum is profile-like; rendering observed spectrum only."
+                .to_string(),
+        );
+        return None;
+    }
+
+    let report = annotate_peaks(
+        context,
+        spectrum.meta.precursor_mz,
+        &spectrum.mz,
+        &spectrum.intensity,
+    );
+    if let Some(check) = report.precursor_check.as_ref() {
+        if !check.within_tolerance {
+            warnings.push(format!(
+                "Precursor mismatch for {}+: observed {:.4}, theoretical {:.4} ({:+.4} Da, {:+.1} ppm, isotope error {}).",
+                check.charge,
+                check.observed_mz,
+                check.theoretical_mz,
+                check.error_da,
+                check.error_ppm,
+                check.isotope_error,
+            ));
+        }
+    }
+    Some(report)
+}
+
+fn write_plot_svg(
+    svg_path: &Path,
+    input_path: &Path,
+    spectrum: &LoadedSpectrum,
+    prepared: &PlotPreparedData,
+    options: &PlotOptions,
+    display_charge: Option<i32>,
+    annotation_context: Option<&AnnotationContext>,
+    annotation_report: Option<&AnnotationReport>,
+    warnings: &[String],
+) -> anyhow::Result<()> {
+    if let Some(parent) = svg_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+    }
+    write_spectrum_svg(
+        svg_path,
+        input_path,
+        SVG_WIDTH,
+        SVG_HEIGHT,
+        spectrum,
+        prepared.render_mode,
+        prepared.bounds,
+        prepared.y_max,
+        &prepared.points,
+        options.normalize,
+        display_charge,
+        !options.remove_precursor,
+        options.neutral_loss_label_min_frac,
+        annotation_context,
+        annotation_report,
+        warnings,
+    )
+}
+
+fn print_plot_summary(
+    spectrum: &LoadedSpectrum,
+    display_charge: Option<i32>,
+    annotation_context: Option<&AnnotationContext>,
+    annotation_report: Option<&AnnotationReport>,
+    warnings: &[String],
+) {
     println!(
         "Scan {} (index {}) | ms{} | points {} | precursor {} | base peak {:.4} @ {:.3e}",
         spectrum.meta.scan_id,
@@ -350,8 +653,8 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
         spectrum.stats.base_peak_mz,
         spectrum.stats.base_peak_intensity
     );
-    if let Some(context) = annotation_context.as_ref() {
-        if let Some(report) = annotation_report.as_ref() {
+    if let Some(context) = annotation_context {
+        if let Some(report) = annotation_report {
             println!(
                 "Annotation: {} theoretical ions, {} matches across {} observed peaks using {}",
                 report.fragments.len(),
@@ -364,27 +667,7 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
                 format_quality_metrics(&report.quality, context.tolerance)
             );
             if let Some(check) = report.precursor_check.as_ref() {
-                if check.isotope_error == 0 {
-                    println!(
-                        "Precursor check: observed {:.4} vs theoretical {:.4} for {}+ ({:+.4} Da, {:+.1} ppm)",
-                        check.observed_mz,
-                        check.theoretical_mz,
-                        check.charge,
-                        check.error_da,
-                        check.error_ppm,
-                    );
-                } else {
-                    println!(
-                        "Precursor check: observed {:.4} vs theoretical {:.4} for {}+ ({:+.4} Da, {:+.1} ppm) using isotope error {} (monoisotopic {:.4})",
-                        check.observed_mz,
-                        check.theoretical_mz,
-                        check.charge,
-                        check.error_da,
-                        check.error_ppm,
-                        check.isotope_error,
-                        check.monoisotopic_theoretical_mz,
-                    );
-                }
+                print_precursor_check(check);
             }
         } else {
             println!(
@@ -396,7 +679,108 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
     for warning in warnings {
         eprintln!("warning: {warning}");
     }
+}
 
+fn print_precursor_check(check: &PrecursorCheck) {
+    if check.isotope_error == 0 {
+        println!(
+            "Precursor check: observed {:.4} vs theoretical {:.4} for {}+ ({:+.4} Da, {:+.1} ppm)",
+            check.observed_mz, check.theoretical_mz, check.charge, check.error_da, check.error_ppm,
+        );
+    } else {
+        println!(
+            "Precursor check: observed {:.4} vs theoretical {:.4} for {}+ ({:+.4} Da, {:+.1} ppm) using isotope error {} (monoisotopic {:.4})",
+            check.observed_mz,
+            check.theoretical_mz,
+            check.charge,
+            check.error_da,
+            check.error_ppm,
+            check.isotope_error,
+            check.monoisotopic_theoretical_mz,
+        );
+    }
+}
+
+fn write_psm_json(
+    path: &Path,
+    input_path: &Path,
+    pepxml_path: &Path,
+    svg_path: &Path,
+    spectrum: &LoadedSpectrum,
+    hit: &PepXmlHit,
+    context: &AnnotationContext,
+    report: Option<&AnnotationReport>,
+    warnings: &[String],
+) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+    }
+
+    let payload = PsmPlotJson {
+        mzml: input_path.display().to_string(),
+        pepxml: pepxml_path.display().to_string(),
+        svg: svg_path.display().to_string(),
+        scan: PsmScanJson {
+            scan_id: spectrum.meta.scan_id.clone(),
+            index: spectrum.meta.idx,
+            ms_level: spectrum.meta.ms_level,
+            rt_minutes: spectrum.meta.rt_minutes.map(f64::from),
+            precursor_mz: spectrum.meta.precursor_mz,
+            precursor_charge: spectrum.meta.precursor_charge,
+            points: spectrum.stats.points as usize,
+            base_peak_mz: spectrum.stats.base_peak_mz,
+            base_peak_intensity: spectrum.stats.base_peak_intensity,
+        },
+        psm: PsmHitJson {
+            rank: hit.hit_rank,
+            peptide: hit.peptide.clone(),
+            assumed_charge: hit.assumed_charge,
+            spectrum: hit.spectrum.clone(),
+            start_scan: hit.start_scan,
+            end_scan: hit.end_scan,
+            protein: hit.protein.clone(),
+            calc_neutral_pep_mass: hit.calc_neutral_pep_mass,
+            massdiff: hit.massdiff,
+            scores: hit.scores.clone(),
+            modifications: hit.modifications.clone(),
+        },
+        annotation: PsmAnnotationJson {
+            modified_sequence: context.modified_sequence(),
+            charge_context: context.charge_context,
+            tolerance: context.tolerance.label(),
+            theoretical_ions: report.map(|value| value.fragments.len()).unwrap_or(0),
+            matches: report.map(|value| value.matches.len()).unwrap_or(0),
+            matched_observed_peaks: report.map(|value| value.matched_peak_count()).unwrap_or(0),
+        },
+        quality: report.map(|value| PsmQualityJson {
+            snr: value.quality.snr_like,
+            log2_snr: value.quality.log2_snr_like,
+            cosine: value.quality.cosine,
+            frag_error_mae_ppm: value.quality.frag_error_mae_ppm,
+            frag_error_mae_da: value.quality.frag_error_mae_da,
+        }),
+        precursor_check: report
+            .and_then(|value| value.precursor_check.as_ref())
+            .map(|check| PsmPrecursorCheckJson {
+                charge: check.charge,
+                monoisotopic_theoretical_mz: check.monoisotopic_theoretical_mz,
+                theoretical_mz: check.theoretical_mz,
+                observed_mz: check.observed_mz,
+                isotope_error: check.isotope_error,
+                error_da: check.error_da,
+                error_ppm: check.error_ppm,
+                within_tolerance: check.within_tolerance,
+            }),
+        warnings: warnings.to_vec(),
+    };
+
+    let file =
+        fs::File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
+    serde_json::to_writer_pretty(file, &payload)
+        .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
 }
 
@@ -444,6 +828,23 @@ fn parse_plot_args(args: Vec<String>) -> anyhow::Result<PlotOptions> {
                     .next()
                     .context("--peptide/--sequence expects a value")?;
                 set_peptide_input(&mut options, peptide)?;
+            }
+            "--pepxml" | "--pep-xml" => {
+                if options.pepxml_path.is_some() {
+                    anyhow::bail!("specify --pepxml only once");
+                }
+                options.pepxml_path = Some(PathBuf::from(
+                    iter.next().context("--pepxml expects a path")?,
+                ));
+            }
+            "--top-n" => {
+                let raw = iter.next().context("--top-n expects an integer")?;
+                let value = raw.parse::<usize>().context("invalid --top-n")?;
+                if value == 0 {
+                    anyhow::bail!("--top-n must be at least 1");
+                }
+                options.top_n = value;
+                options.top_n_explicit = true;
             }
             "--mod" => {
                 options
@@ -530,31 +931,46 @@ fn parse_plot_args(args: Vec<String>) -> anyhow::Result<PlotOptions> {
             anyhow::bail!("--mz-min must be smaller than --mz-max");
         }
     }
-    if options.peptide_input.is_none() {
+    if options.peptide_input.is_some() && options.pepxml_path.is_some() {
+        anyhow::bail!("specify only one of --peptide or --pepxml");
+    }
+    if options.pepxml_path.is_some() && !matches!(options.input_format, Some(PlotInputFormat::Mzml))
+    {
+        anyhow::bail!("--pepxml is currently supported only with --mzml input");
+    }
+
+    let has_annotation_source = options.peptide_input.is_some() || options.pepxml_path.is_some();
+    if !has_annotation_source {
         if !options.mod_inputs.is_empty() {
             anyhow::bail!("--mod requires --peptide (or a sequence alias)");
         }
         if options.neutral_losses_enabled {
-            anyhow::bail!("--neutral-losses requires --peptide (or a sequence alias)");
+            anyhow::bail!("--neutral-losses requires --peptide/--pepxml annotation input");
         }
         if (options.neutral_loss_label_min_frac - DEFAULT_NEUTRAL_LOSS_LABEL_MIN_FRAC).abs()
             > f64::EPSILON
         {
             anyhow::bail!(
-                "--neutral-loss-min-frac requires --peptide together with --neutral-losses"
+                "--neutral-loss-min-frac requires --peptide/--pepxml together with --neutral-losses"
             );
         }
         if options.tolerance_explicit {
-            anyhow::bail!("--tol-ppm/--tol-da require --peptide (or a sequence alias)");
+            anyhow::bail!("--tol-ppm/--tol-da require --peptide/--pepxml annotation input");
         }
         if options.isotope_errors_explicit {
-            anyhow::bail!("--isotope-errors requires --peptide (or a sequence alias)");
+            anyhow::bail!("--isotope-errors requires --peptide/--pepxml annotation input");
         }
     } else if !options.neutral_losses_enabled
         && (options.neutral_loss_label_min_frac - DEFAULT_NEUTRAL_LOSS_LABEL_MIN_FRAC).abs()
             > f64::EPSILON
     {
         anyhow::bail!("--neutral-loss-min-frac requires --neutral-losses");
+    }
+    if options.pepxml_path.is_some() && !options.mod_inputs.is_empty() {
+        anyhow::bail!("--mod cannot be combined with --pepxml; use pepXML modifications");
+    }
+    if options.top_n_explicit && options.pepxml_path.is_none() {
+        anyhow::bail!("--top-n requires --pepxml");
     }
 
     Ok(options)
@@ -660,6 +1076,8 @@ fn print_plot_help() {
     println!("  --sequence <SEQ>             Alias for --peptide");
     println!("  --sequence-modi <SEQ>        Alias for --peptide");
     println!("  --sequencemodi <SEQ>         Alias for --peptide");
+    println!("  --pepxml <file>              Annotate selected mzML scan from pepXML/pepXML.gz hits; mutually exclusive with --peptide");
+    println!("  --top-n <n>                  Number of pepXML hits to plot for the selected scan (default: 1)");
     println!("  --mod <position>:<delta>     Repeatable explicit modification, 1-based");
     println!(
         "  --neutral-losses             Enable residue-aware -H2O / -NH3 and phospho -H3PO4 fragment variants"
@@ -685,6 +1103,7 @@ fn print_plot_help() {
     println!(
         "  {program} plot --mzml sample.mzML --index 4821 --peptide DSAVYFCARTKILDFD --mod 7:+57.021464"
     );
+    println!("  {program} plot --mzml sample.mzML --scan 4821 --pepxml search.pep.xml --top-n 3");
     println!(
         "  {program} plot --mzml sample.mzML --scan 4821 --peptide DSAVYFCARTKILDFD --neutral-losses --neutral-loss-min-frac 0.05 --svg-prefix calibrated"
     );
@@ -733,6 +1152,53 @@ fn default_output_path(
         ));
     }
 
+    parts.push(if neutral_losses_enabled {
+        "nl-on".to_string()
+    } else {
+        "nl-off".to_string()
+    });
+    parts.push(format!("ms{}", spectrum.meta.ms_level));
+    parts.push(ts.to_string());
+
+    let filename = format!("{}.svg", parts.join("__"));
+    PathBuf::from("exports").join(filename)
+}
+
+fn default_pepxml_output_path(
+    input_path: &Path,
+    spectrum: &LoadedSpectrum,
+    annotation_context: &AnnotationContext,
+    display_charge: Option<i32>,
+    neutral_losses_enabled: bool,
+    svg_prefix: Option<&str>,
+    hit: &PepXmlHit,
+) -> PathBuf {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let mut parts = Vec::<String>::new();
+    if let Some(prefix) = svg_prefix.and_then(sanitize_filename_label) {
+        parts.push(prefix);
+    }
+
+    let source_stem = input_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .and_then(sanitize_filename_label)
+        .unwrap_or_else(|| "spectrum".to_string());
+    parts.push(source_stem);
+
+    let scan_component = extract_scan_number(&spectrum.meta.scan_id)
+        .map(|scan| format!("scan{scan}"))
+        .unwrap_or_else(|| format!("index{}", spectrum.meta.idx));
+    parts.push(scan_component);
+    parts.push(format!("rank{}", hit.hit_rank));
+    parts.push(default_peptide_label(
+        annotation_context.peptide.sequence(),
+        display_charge.or(annotation_context.charge_context),
+    ));
     parts.push(if neutral_losses_enabled {
         "nl-on".to_string()
     } else {
@@ -2365,6 +2831,83 @@ mod tests {
         ));
         assert_eq!(options.mod_inputs, vec!["7:+57.021464"]);
         assert_eq!(options.tolerance, MassTolerance::Da(0.5));
+    }
+
+    #[test]
+    fn parse_plot_args_accepts_pepxml_top_n_and_annotation_options() {
+        let options = parse_plot_args(vec![
+            "--mzml".to_string(),
+            "x.mzML".to_string(),
+            "--scan".to_string(),
+            "2".to_string(),
+            "--pepxml".to_string(),
+            "search.pep.xml".to_string(),
+            "--top-n".to_string(),
+            "3".to_string(),
+            "--tol-da".to_string(),
+            "0.5".to_string(),
+            "--neutral-losses".to_string(),
+        ])
+        .expect("options parse");
+        assert_eq!(
+            options.pepxml_path.as_deref(),
+            Some(Path::new("search.pep.xml"))
+        );
+        assert_eq!(options.top_n, 3);
+        assert_eq!(options.tolerance, MassTolerance::Da(0.5));
+        assert!(options.neutral_losses_enabled);
+    }
+
+    #[test]
+    fn parse_plot_args_rejects_peptide_and_pepxml_together() {
+        let err = parse_plot_args(vec![
+            "--mzml".to_string(),
+            "x.mzML".to_string(),
+            "--scan".to_string(),
+            "2".to_string(),
+            "--peptide".to_string(),
+            "PEPTIDEK".to_string(),
+            "--pepxml".to_string(),
+            "search.pep.xml".to_string(),
+        ])
+        .expect_err("conflicting annotation inputs should fail");
+        assert!(err
+            .to_string()
+            .contains("only one of --peptide or --pepxml"));
+    }
+
+    #[test]
+    fn parse_plot_args_rejects_mod_with_pepxml() {
+        let err = parse_plot_args(vec![
+            "--mzml".to_string(),
+            "x.mzML".to_string(),
+            "--scan".to_string(),
+            "2".to_string(),
+            "--pepxml".to_string(),
+            "search.pep.xml".to_string(),
+            "--mod".to_string(),
+            "4:+15.9949".to_string(),
+        ])
+        .expect_err("manual mods with pepXML should fail");
+        assert!(err
+            .to_string()
+            .contains("--mod cannot be combined with --pepxml"));
+    }
+
+    #[test]
+    fn parse_plot_args_rejects_top_n_without_pepxml() {
+        let err = parse_plot_args(vec![
+            "--mzml".to_string(),
+            "x.mzML".to_string(),
+            "--scan".to_string(),
+            "2".to_string(),
+            "--top-n".to_string(),
+            "3".to_string(),
+            "--peptide".to_string(),
+            "PEPTIDEK".to_string(),
+        ])
+        .expect_err("top-n without pepXML should fail");
+        assert!(err.to_string().contains("--top-n requires --pepxml"));
     }
 
     #[test]

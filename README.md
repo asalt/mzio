@@ -73,11 +73,26 @@ cargo run -- spectra \
   --reindex
 ```
 
+## Real-data fixtures
+
+Stable slim mzML/pepXML fixtures live under `data/` and are exercised by the
+`plot` CLI tests. The mzML files are tracked with Git LFS; the matching pepXML
+excerpts remain plain text.
+
+- `data/exploris480_hela_digest` covers ranked pepXML hits for one HeLa digest
+  MS/MS scan.
+- `data/exploris480_phospho_localization` covers alternate phospho-localization
+  hits for one peptide.
+
+Regeneration sources, when needed, should be staged under ignored repo-local
+paths in `data/_sources/`; see `data/README.md`.
+
 ## Plot notes
 
 - v1 annotation is Rust-only and does not require Python.
 - Sequence scope is intentionally narrow for now: amino-acid letters with optional inline mass shifts like `M[+15.9949]`, `S[+79.9663]`, or leading N-term shifts like `[+42.0106]PEPTIDE`, plus an optional `/charge` suffix.
 - Fixed mods are not assumed automatically; use repeatable `--mod <position>:<delta>` when needed.
+- `mzio plot --mzml run.mzML --scan <n> --pepxml search.pep.xml --top-n 3` uses pepXML or pepXML.gz hits as the annotation source. `--pepxml` and `--peptide` are mutually exclusive; each PSM plot gets a same-stem JSON sidecar.
 - If an inline mass shift omits the sign, it is treated as positive.
 - Precursor checking now allows isotope-error windows via `--isotope-errors`, with `0,1,2` as the default.
 - `--neutral-losses` enables common residue-aware `-H2O` and `-NH3` fragment variants, plus phospho `-H3PO4` on phospho-Ser/Thr-containing fragments.
