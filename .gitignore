@@ -12,6 +12,19 @@ scripts/
 # Keep a tiny, synthetic file for demos/tests.
 !assets/demo.mzML
 
+# Keep curated slim fixture data visible for Git LFS.
+!data/
+!data/**/
+!data/**/mzml/*.mzML
+!data/**/mzml/*.mzml
+!data/**/pepxml/*.pep.xml
+!data/**/pepxml/*.pepXML
+!data/**/pepxml/*.pepXML.gz
+data/_sources/
+data/_sources/**
+data/_work/
+data/_work/**
+
 .codex
 .codex/*
 .codex-session

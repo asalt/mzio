@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<msms_pipeline_analysis>
+  <msms_run_summary>
+    <spectrum_query start_scan="9065" assumed_charge="2" spectrum="99990_236_EXP_Hela_100ng_200nl_Jan8.9065.9065.2" end_scan="9065" index="3199" precursor_neutral_mass="834.36896" retention_time_sec="1044.4765782604218">
+      <search_result>
+        <search_hit peptide="MNTNPSR" massdiff="0.0035400390625" calc_neutral_pep_mass="834.3654" peptide_next_aa="G" num_missed_cleavages="0" num_tol_term="2" num_tot_proteins="1" tot_num_ions="12" hit_rank="1" num_matched_ions="8" protein="gi|None|ref|NP_001257420.1|geneid|23521|homologene||taxon|9606|symbol|RPL13A 60S ribosomal protein L13a isoform 2 [Homo sapiens]" peptide_prev_aa="-" is_rejected="0">
+          <modification_info>
+            <mod_aminoacid_mass mass="147.0354" position="1"/>
+          </modification_info>
+          <search_score name="hyperscore" value="16.076"/>
+          <search_score name="nextscore" value="11.175"/>
+          <search_score name="expect" value="1.276439e-01"/>
+        </search_hit>
+        <search_hit peptide="MNGVNER" massdiff="0.0035400390625" calc_neutral_pep_mass="834.3654" peptide_next_aa="F" num_missed_cleavages="0" num_tol_term="2" num_tot_proteins="1" tot_num_ions="12" hit_rank="2" num_matched_ions="5" protein="gi|None|ref|NP_035595.2|geneid|20739|homologene|74460|taxon|10090|symbol|Spta1 spectrin alpha chain, erythrocytic 1 [Mus musculus]" peptide_prev_aa="K" is_rejected="0">
+          <modification_info>
+            <mod_aminoacid_mass mass="147.0354" position="1"/>
+          </modification_info>
+          <search_score name="hyperscore" value="11.175"/>
+          <search_score name="nextscore" value="10.239"/>
+          <search_score name="expect" value="2.144124e+00"/>
+        </search_hit>
+        <search_hit peptide="TCAPGSSR" massdiff="0.0035400390625" calc_neutral_pep_mass="834.3654" peptide_next_aa="P" num_missed_cleavages="0" num_tol_term="2" num_tot_proteins="1" tot_num_ions="14" hit_rank="3" num_matched_ions="5" protein="gi|None|ref|XP_030108827.1|geneid|115489698|homologene||taxon|10090|symbol|Gm52612 uncharacterized protein LOC115489698 [Mus musculus]" peptide_prev_aa="R" is_rejected="0">
+          <modification_info>
+            <mod_aminoacid_mass mass="160.0307" position="2"/>
+          </modification_info>
+          <search_score name="hyperscore" value="10.239"/>
+          <search_score name="nextscore" value="9.73"/>
+          <search_score name="expect" value="3.674937e+00"/>
+        </search_hit>
+        <search_hit peptide="RDEGDSR" massdiff="1.0062255859375" calc_neutral_pep_mass="833.36273" peptide_next_aa="K" num_missed_cleavages="1" num_tol_term="2" num_tot_proteins="5" tot_num_ions="12" hit_rank="4" num_matched_ions="6" protein="gi|None|ref|NP_001156330.1|geneid|60345|homologene|11023|taxon|10090|symbol|Nrip2 nuclear receptor-interacting protein 2 isoform 1 [Mus musculus]" peptide_prev_aa="R" is_rejected="0">
+          <alternative_protein protein="gi|None|ref|NP_068363.2|geneid|60345|homologene|11023|taxon|10090|symbol|Nrip2 nuclear receptor-interacting protein 2 isoform 2 [Mus musculus]" peptide_prev_aa="R" peptide_next_aa="K" num_tol_term="2"/>
+          <alternative_protein protein="gi|None|ref|XP_006506512.1|geneid|60345|homologene|11023|taxon|10090|symbol|Nrip2 nuclear receptor-interacting protein 2 isoform X1 [Mus musculus]" peptide_prev_aa="R" peptide_next_aa="K" num_tol_term="2"/>
+          <alternative_protein protein="gi|None|ref|XP_006506514.1|geneid|60345|homologene|11023|taxon|10090|symbol|Nrip2 nuclear receptor-interacting protein 2 isoform X3 [Mus musculus]" peptide_prev_aa="R" peptide_next_aa="K" num_tol_term="2"/>
+          <alternative_protein protein="gi|None|ref|XP_030111383.1|geneid|60345|homologene|11023|taxon|10090|symbol|Nrip2 nuclear receptor-interacting protein 2 isoform X2 [Mus musculus]" peptide_prev_aa="R" peptide_next_aa="K" num_tol_term="2"/>
+          <search_score name="hyperscore" value="9.73"/>
+          <search_score name="nextscore" value="9.228"/>
+          <search_score name="expect" value="4.926065e+00"/>
+        </search_hit>
+        <search_hit peptide="MRGGENR" massdiff="-0.0076904296875" calc_neutral_pep_mass="834.37665" peptide_next_aa="P" num_missed_cleavages="1" num_tol_term="2" num_tot_proteins="2" tot_num_ions="12" hit_rank="5" num_matched_ions="4" protein="gi|None|ref|NP_001334939.1|geneid|100499483|homologene||taxon|9606|symbol|CCDC180 coiled-coil domain-containing protein 180 isoform 2 [Homo sapiens]" peptide_prev_aa="-" is_rejected="0">
+          <alternative_protein protein="gi|None|ref|NP_065944.2|geneid|100499483|homologene||taxon|9606|symbol|CCDC180 coiled-coil domain-containing protein 180 isoform 1 [Homo sapiens]" peptide_prev_aa="-" peptide_next_aa="P" num_tol_term="2"/>
+          <modification_info>
+            <mod_aminoacid_mass mass="147.0354" position="1"/>
+          </modification_info>
+          <search_score name="hyperscore" value="9.228"/>
+          <search_score name="nextscore" value="9.086"/>
+          <search_score name="expect" value="6.576580e+00"/>
+        </search_hit>
+      </search_result>
+    </spectrum_query>
+  </msms_run_summary>
+</msms_pipeline_analysis>

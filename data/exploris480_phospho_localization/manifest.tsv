@@ -1,0 +1,2 @@
+fixture	source_pepxml	source_mzml	scan	hit_count	spectrum	charge	notes
+pepxml/49108_F13_scan4877_phospho_top_hits.pep.xml	49108_1_EXP_802_PDX_1mg_phos_oneforth_F13.pepXML	49108_1_EXP_802_PDX_1mg_phos_oneforth_F13.mzML	4877	5	49108_1_EXP_802_PDX_1mg_phos_oneforth_F13.4877.4877.2	2	same peptide, alternate phospho localization across ranks

@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<msms_pipeline_analysis>
+  <msms_run_summary>
+    <spectrum_query start_scan="4877" uncalibrated_precursor_neutral_mass="1652.6467" assumed_charge="2" spectrum="49108_1_EXP_802_PDX_1mg_phos_oneforth_F13.4877.4877.2" spectrumNativeID="controllerType=0 controllerNumber=1 scan=4877" end_scan="4877" index="829" precursor_neutral_mass="1652.6526" retention_time_sec="1194.4167709350586">
+      <search_result>
+        <search_hit peptide="TGSESSQTGTSTTSSR" massdiff="0.0" calc_neutral_pep_mass="1652.6526" peptide_next_aa="S" num_missed_cleavages="0" num_tol_term="2" protein_descr="eukaryotic translation initiation factor 4B isoform 1 [Homo sapiens]" num_tot_proteins="3" tot_num_ions="30" hit_rank="1" num_matched_ions="13" protein="gi|None|ref|NP_001287750.1|geneid|1975|homologene||taxon|9606|symbol|EIF4B" peptide_prev_aa="R" is_rejected="0">
+          <alternative_protein protein_descr="eukaryotic translation initiation factor 4B isoform 2 [Homo sapiens]" protein="gi|None|ref|NP_001408.2|geneid|1975|homologene||taxon|9606|symbol|EIF4B" peptide_prev_aa="R" peptide_next_aa="S" num_tol_term="2"/>
+          <alternative_protein protein_descr="eukaryotic translation initiation factor 4B isoform 3 [Homo sapiens]" protein="gi|None|ref|NP_001317583.1|geneid|1975|homologene||taxon|9606|symbol|EIF4B" peptide_prev_aa="R" peptide_next_aa="S" num_tol_term="2"/>
+          <modification_info modified_peptide="TGS[167]ESSQTGTSTTSSR">
+            <mod_aminoacid_mass mass="166.998352" position="3"/>
+          </modification_info>
+          <search_score name="hyperscore" value="27.604"/>
+          <search_score name="nextscore" value="25.043"/>
+          <search_score name="expect" value="7.647855e-11"/>
+        </search_hit>
+        <search_hit peptide="TGSESSQTGTSTTSSR" massdiff="0.0" calc_neutral_pep_mass="1652.6526" peptide_next_aa="S" num_missed_cleavages="0" num_tol_term="2" protein_descr="eukaryotic translation initiation factor 4B isoform 1 [Homo sapiens]" num_tot_proteins="3" tot_num_ions="30" hit_rank="2" num_matched_ions="12" protein="gi|None|ref|NP_001287750.1|geneid|1975|homologene||taxon|9606|symbol|EIF4B" peptide_prev_aa="R" is_rejected="0">
+          <alternative_protein protein_descr="eukaryotic translation initiation factor 4B isoform 2 [Homo sapiens]" protein="gi|None|ref|NP_001408.2|geneid|1975|homologene||taxon|9606|symbol|EIF4B" peptide_prev_aa="R" peptide_next_aa="S" num_tol_term="2"/>
+          <alternative_protein protein_descr="eukaryotic translation initiation factor 4B isoform 3 [Homo sapiens]" protein="gi|None|ref|NP_001317583.1|geneid|1975|homologene||taxon|9606|symbol|EIF4B" peptide_prev_aa="R" peptide_next_aa="S" num_tol_term="2"/>
+          <modification_info modified_peptide="TGSES[167]SQTGTSTTSSR">
+            <mod_aminoacid_mass mass="166.998352" position="5"/>
+          </modification_info>
+          <search_score name="hyperscore" value="25.043"/>
+          <search_score name="nextscore" value="25.014"/>
+          <search_score name="expect" value="3.107051e-09"/>
+        </search_hit>
+        <search_hit peptide="TGSESSQTGTSTTSSR" massdiff="0.0" calc_neutral_pep_mass="1652.6526" peptide_next_aa="S" num_missed_cleavages="0" num_tol_term="2" protein_descr="eukaryotic translation initiation factor 4B isoform 1 [Homo sapiens]" num_tot_proteins="3" tot_num_ions="30" hit_rank="3" num_matched_ions="12" protein="gi|None|ref|NP_001287750.1|geneid|1975|homologene||taxon|9606|symbol|EIF4B" peptide_prev_aa="R" is_rejected="0">
+          <alternative_protein protein_descr="eukaryotic translation initiation factor 4B isoform 2 [Homo sapiens]" protein="gi|None|ref|NP_001408.2|geneid|1975|homologene||taxon|9606|symbol|EIF4B" peptide_prev_aa="R" peptide_next_aa="S" num_tol_term="2"/>
+          <alternative_protein protein_descr="eukaryotic translation initiation factor 4B isoform 3 [Homo sapiens]" protein="gi|None|ref|NP_001317583.1|geneid|1975|homologene||taxon|9606|symbol|EIF4B" peptide_prev_aa="R" peptide_next_aa="S" num_tol_term="2"/>
+          <modification_info modified_peptide="T[181]GSESSQTGTSTTSSR">
+            <mod_aminoacid_mass mass="181.014008" position="1"/>
+          </modification_info>
+          <search_score name="hyperscore" value="25.014"/>
+          <search_score name="nextscore" value="22.56"/>
+          <search_score name="expect" value="3.240154e-09"/>
+        </search_hit>
+        <search_hit peptide="TGSESSQTGTSTTSSR" massdiff="0.0" calc_neutral_pep_mass="1652.6526" peptide_next_aa="S" num_missed_cleavages="0" num_tol_term="2" protein_descr="eukaryotic translation initiation factor 4B isoform 1 [Homo sapiens]" num_tot_proteins="3" tot_num_ions="30" hit_rank="4" num_matched_ions="11" protein="gi|None|ref|NP_001287750.1|geneid|1975|homologene||taxon|9606|symbol|EIF4B" peptide_prev_aa="R" is_rejected="0">
+          <alternative_protein protein_descr="eukaryotic translation initiation factor 4B isoform 2 [Homo sapiens]" protein="gi|None|ref|NP_001408.2|geneid|1975|homologene||taxon|9606|symbol|EIF4B" peptide_prev_aa="R" peptide_next_aa="S" num_tol_term="2"/>
+          <alternative_protein protein_descr="eukaryotic translation initiation factor 4B isoform 3 [Homo sapiens]" protein="gi|None|ref|NP_001317583.1|geneid|1975|homologene||taxon|9606|symbol|EIF4B" peptide_prev_aa="R" peptide_next_aa="S" num_tol_term="2"/>
+          <modification_info modified_peptide="TGSESS[167]QTGTSTTSSR">
+            <mod_aminoacid_mass mass="166.998352" position="6"/>
+          </modification_info>
+          <search_score name="hyperscore" value="22.56"/>
+          <search_score name="nextscore" value="17.72"/>
+          <search_score name="expect" value="1.127607e-07"/>
+        </search_hit>
+        <search_hit peptide="TGSESSQTGTSTTSSR" massdiff="0.0" calc_neutral_pep_mass="1652.6526" peptide_next_aa="S" num_missed_cleavages="0" num_tol_term="2" protein_descr="eukaryotic translation initiation factor 4B isoform 1 [Homo sapiens]" num_tot_proteins="3" tot_num_ions="30" hit_rank="5" num_matched_ions="9" protein="gi|None|ref|NP_001287750.1|geneid|1975|homologene||taxon|9606|symbol|EIF4B" peptide_prev_aa="R" is_rejected="0">
+          <alternative_protein protein_descr="eukaryotic translation initiation factor 4B isoform 2 [Homo sapiens]" protein="gi|None|ref|NP_001408.2|geneid|1975|homologene||taxon|9606|symbol|EIF4B" peptide_prev_aa="R" peptide_next_aa="S" num_tol_term="2"/>
+          <alternative_protein protein_descr="eukaryotic translation initiation factor 4B isoform 3 [Homo sapiens]" protein="gi|None|ref|NP_001317583.1|geneid|1975|homologene||taxon|9606|symbol|EIF4B" peptide_prev_aa="R" peptide_next_aa="S" num_tol_term="2"/>
+          <modification_info modified_peptide="TGSESSQT[181]GTSTTSSR">
+            <mod_aminoacid_mass mass="181.014008" position="8"/>
+          </modification_info>
+          <search_score name="hyperscore" value="17.72"/>
+          <search_score name="nextscore" value="13.148"/>
+          <search_score name="expect" value="1.237725e-04"/>
+        </search_hit>
+      </search_result>
+    </spectrum_query>
+  </msms_run_summary>
+</msms_pipeline_analysis>

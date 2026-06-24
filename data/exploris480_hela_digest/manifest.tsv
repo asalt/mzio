@@ -1,0 +1,2 @@
+fixture	source_pepxml	source_mzml	scan	hit_count	spectrum	charge
+pepxml/99990_236_EXP_Hela_100ng_200nl_Jan8_scan9065_top_hits.pep.xml	99990_236_EXP_Hela_100ng_200nl_Jan8.pepXML.gz	99990_236_EXP_Hela_100ng_200nl_Jan8.mzML.xz	9065	5	99990_236_EXP_Hela_100ng_200nl_Jan8.9065.9065.2	2

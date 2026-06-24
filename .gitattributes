@@ -1,0 +1,2 @@
+data/**/*.mzML filter=lfs diff=lfs merge=lfs -text
+data/**/*.mzml filter=lfs diff=lfs merge=lfs -text
