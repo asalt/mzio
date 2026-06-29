@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fmt::Write as _;
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -17,7 +17,7 @@ use timsrust::{AcquisitionType, Frame, MSLevel, Metadata};
 
 use crate::annotate::{
     fragment_charge_states, generate_fragments, prepare_annotation, FragmentIon, FragmentSeries,
-    MassTolerance,
+    MassTolerance, NeutralLossKind,
 };
 use crate::mzml::{load_spectrum_by_index, open_reader};
 use crate::scale::CoordinateRange;
@@ -32,6 +32,14 @@ const BRUKER_SO_ENV_VAR: &str = "MZIO_BRUKER_SO";
 const BRUKER_PYTHON_ENV_VAR: &str = "MZIO_PYTHON";
 const DEFAULT_PEPTIDE_CHARGE: i32 = 2;
 const DEFAULT_PSEUDO_MS2_RT_WINDOW_MIN: f64 = 0.5;
+const DEFAULT_RT_SMOOTH_WINDOW_POINTS: usize = 9;
+const RT_SMOOTH_ZERO_WEIGHT: f64 = 0.25;
+const PSEUDO_MS2_NEUTRAL_LOSS_MIN_RELATIVE_INTENSITY: f64 = 0.03;
+const COMMON_NEUTRAL_LOSSES: [NeutralLossKind; 3] = [
+    NeutralLossKind::Water,
+    NeutralLossKind::Ammonia,
+    NeutralLossKind::PhosphoricAcid,
+];
 const SVG_WIDTH: u32 = 1320;
 const SVG_HEIGHT: u32 = 980;
 const SVG_MARGIN_X: f64 = 60.0;
@@ -142,6 +150,8 @@ pub(crate) struct DiaFragmentTarget {
     pub(crate) input: String,
     pub(crate) label: String,
     pub(crate) series: String,
+    pub(crate) cleavage_index: usize,
+    pub(crate) neutral_loss: Option<NeutralLossKind>,
     pub(crate) charge: u8,
     pub(crate) mz: f64,
 }
@@ -160,8 +170,11 @@ struct DiaSliceOptions {
     fragment_input: Option<String>,
     mod_inputs: Vec<String>,
     charge_override: Option<i32>,
+    neutral_losses_enabled: bool,
     pseudo_ms2: bool,
     pseudo_ms2_rt_window_min: f64,
+    rt_smooth: bool,
+    rt_smooth_window: usize,
     verbosity: Verbosity,
 }
 
@@ -180,8 +193,11 @@ impl Default for DiaSliceOptions {
             fragment_input: None,
             mod_inputs: Vec::new(),
             charge_override: None,
+            neutral_losses_enabled: false,
             pseudo_ms2: false,
             pseudo_ms2_rt_window_min: DEFAULT_PSEUDO_MS2_RT_WINDOW_MIN,
+            rt_smooth: false,
+            rt_smooth_window: DEFAULT_RT_SMOOTH_WINDOW_POINTS,
             verbosity: Verbosity::Normal,
         }
     }
@@ -212,6 +228,124 @@ impl Verbosity {
             println!("{args}");
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TimsrustFrameCandidate {
+    reader_index: usize,
+    rt_seconds: f64,
+}
+
+#[derive(Debug)]
+struct ProgressReporter {
+    enabled: bool,
+    interactive: bool,
+    label: String,
+    total: usize,
+    current: usize,
+    last_percent: Option<usize>,
+    next_log_percent: usize,
+    finished: bool,
+}
+
+impl ProgressReporter {
+    fn new(label: impl Into<String>, total: usize, verbosity: Verbosity) -> Self {
+        Self {
+            enabled: verbosity != Verbosity::Quiet && total > 0,
+            interactive: io::stderr().is_terminal(),
+            label: label.into(),
+            total,
+            current: 0,
+            last_percent: None,
+            next_log_percent: 10,
+            finished: false,
+        }
+    }
+
+    fn advance(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        self.current = (self.current + 1).min(self.total);
+        let percent = progress_percent(self.current, self.total);
+        if self.interactive {
+            if self.last_percent != Some(percent) || self.current == self.total {
+                self.render_inline(percent);
+                self.last_percent = Some(percent);
+            }
+        } else if percent >= self.next_log_percent || self.current == self.total {
+            eprintln!(
+                "{}: {}/{} frames ({}%)",
+                self.label, self.current, self.total, percent
+            );
+            while self.next_log_percent <= percent {
+                self.next_log_percent += 10;
+            }
+            self.last_percent = Some(percent);
+        }
+    }
+
+    fn finish(&mut self) {
+        if !self.enabled || self.finished {
+            return;
+        }
+        if self.current < self.total {
+            self.current = self.total;
+            let percent = progress_percent(self.current, self.total);
+            if self.interactive {
+                self.render_inline(percent);
+            } else if self.last_percent != Some(percent) {
+                eprintln!(
+                    "{}: {}/{} frames ({}%)",
+                    self.label, self.current, self.total, percent
+                );
+            }
+        }
+        if self.interactive {
+            eprintln!();
+        }
+        self.finished = true;
+    }
+
+    fn render_inline(&self, percent: usize) {
+        let bar = progress_bar_body(self.current, self.total, 28);
+        eprint!(
+            "\r{}: [{}] {}/{} frames ({:>3}%)",
+            self.label, bar, self.current, self.total, percent
+        );
+        let _ = io::stderr().flush();
+    }
+}
+
+impl Drop for ProgressReporter {
+    fn drop(&mut self) {
+        if self.enabled && self.interactive && !self.finished {
+            eprintln!();
+        }
+    }
+}
+
+fn progress_percent(current: usize, total: usize) -> usize {
+    if total == 0 {
+        100
+    } else {
+        ((current.min(total) * 100) / total).min(100)
+    }
+}
+
+fn progress_bar_body(current: usize, total: usize, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let filled = if total == 0 {
+        width
+    } else {
+        (current.min(total) * width) / total
+    };
+    let mut body = String::with_capacity(width);
+    body.push_str(&"=".repeat(filled));
+    body.push_str(&".".repeat(width.saturating_sub(filled)));
+    body
 }
 
 #[derive(Clone, Debug)]
@@ -252,6 +386,8 @@ impl PseudoMs2RtWindow {
 struct PseudoMs2FragmentEvidence {
     label: String,
     series: String,
+    cleavage_index: usize,
+    neutral_loss: Option<NeutralLossKind>,
     charge: u8,
     mz: f64,
     summed_intensity: f64,
@@ -259,6 +395,34 @@ struct PseudoMs2FragmentEvidence {
     frames_with_signal: usize,
     apex_rt: Option<f64>,
     apex_intensity: f64,
+}
+
+#[derive(Clone, Debug)]
+struct PseudoIonTableRow {
+    cleavage_index: usize,
+    y_ordinal: usize,
+    b1: Vec<PseudoIonTableCell>,
+    b2: Vec<PseudoIonTableCell>,
+    y1: Vec<PseudoIonTableCell>,
+    y2: Vec<PseudoIonTableCell>,
+}
+
+#[derive(Clone, Debug)]
+struct PseudoIonTableCell {
+    label: String,
+    series: String,
+    neutral_loss: Option<NeutralLossKind>,
+    mz: f64,
+    summed_intensity: f64,
+    matched_events: usize,
+    frames_with_signal: usize,
+    apex_rt: Option<f64>,
+}
+
+impl PseudoIonTableCell {
+    fn detected(&self) -> bool {
+        self.summed_intensity > 0.0
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -410,6 +574,8 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
                 enabled: options.pseudo_ms2,
                 rt_window_min: options.pseudo_ms2_rt_window_min,
             },
+            options.rt_smooth,
+            options.rt_smooth_window,
             options.verbosity,
             DiaCapabilities {
                 has_mobility: false,
@@ -428,6 +594,8 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
                 enabled: options.pseudo_ms2,
                 rt_window_min: options.pseudo_ms2_rt_window_min,
             },
+            options.rt_smooth,
+            options.rt_smooth_window,
             options.verbosity,
             &out_prefix,
         ),
@@ -456,6 +624,9 @@ fn print_help() {
     println!("  --sequencemodi <SEQ>     Alias for --peptide");
     println!(
         "  --fragment <ion>         Peptide fragment target, e.g. b8, y8, b8++ [default: precursor]"
+    );
+    println!(
+        "  --neutral-losses       Enable residue-aware -H2O / -NH3 and phospho -H3PO4 fragments"
     );
     println!(
         "  --pseudo-ms2             Write aggregated DIA fragment evidence as pseudo-MS2 TSV/SVG"
@@ -490,6 +661,11 @@ fn print_help() {
     println!(
         "  --mz-bins <n>            Number of bins for the m/z profile [{}]",
         DEFAULT_MZ_PROFILE_BINS
+    );
+    println!("  --rt-smooth              Draw a smoothed overlay on the RT profile");
+    println!(
+        "  --rt-smooth-window <n>   Gaussian smoothing window in profile points [{}]; implies --rt-smooth",
+        DEFAULT_RT_SMOOTH_WINDOW_POINTS
     );
     println!("  -v, --verbose            Print detailed progress/status messages");
     println!("  -q, --quiet              Suppress non-error terminal output");
@@ -563,6 +739,9 @@ fn parse_args(args: Vec<String>) -> anyhow::Result<DiaSliceOptions> {
                     .context("--fragment expects a fragment ion label")?;
                 set_fragment_input(&mut options, fragment)?;
             }
+            "--neutral-losses" => {
+                options.neutral_losses_enabled = true;
+            }
             "--pseudo-ms2" | "--ms2" => {
                 options.pseudo_ms2 = true;
             }
@@ -624,6 +803,20 @@ fn parse_args(args: Vec<String>) -> anyhow::Result<DiaSliceOptions> {
                 }
                 options.mz_profile_bins = bins;
             }
+            "--rt-smooth" => {
+                options.rt_smooth = true;
+            }
+            "--rt-smooth-window" => {
+                let raw = iter
+                    .next()
+                    .context("--rt-smooth-window expects an integer")?;
+                let window = raw.parse::<usize>().context("invalid --rt-smooth-window")?;
+                if window == 0 {
+                    anyhow::bail!("--rt-smooth-window must be at least 1");
+                }
+                options.rt_smooth = true;
+                options.rt_smooth_window = window;
+            }
             "-v" | "--verbose" => {
                 options.verbosity = Verbosity::Verbose;
             }
@@ -657,12 +850,20 @@ fn parse_args(args: Vec<String>) -> anyhow::Result<DiaSliceOptions> {
     if options.peptide_input.is_none() && options.fragment_input.is_some() {
         anyhow::bail!("--fragment requires --peptide (or a sequence alias)");
     }
+    if options.peptide_input.is_none() && options.neutral_losses_enabled {
+        anyhow::bail!("--neutral-losses requires --peptide (or a sequence alias)");
+    }
     if options.peptide_input.is_none() && options.pseudo_ms2 {
         anyhow::bail!("--pseudo-ms2 requires --peptide (or a sequence alias)");
     }
     if options.pseudo_ms2 && options.fragment_input.is_some() {
         anyhow::bail!("--pseudo-ms2 aggregates all peptide fragments; omit --fragment");
     }
+    let neutral_losses: &[NeutralLossKind] = if options.neutral_losses_enabled {
+        COMMON_NEUTRAL_LOSSES.as_slice()
+    } else {
+        &[]
+    };
     let peptide_target = options
         .peptide_input
         .as_deref()
@@ -672,6 +873,7 @@ fn parse_args(args: Vec<String>) -> anyhow::Result<DiaSliceOptions> {
                 options.fragment_input.as_deref(),
                 &options.mod_inputs,
                 options.charge_override,
+                neutral_losses,
             )
         })
         .transpose()?;
@@ -751,11 +953,12 @@ fn resolve_peptide_target(
     fragment_input: Option<&str>,
     mod_inputs: &[String],
     charge_override: Option<i32>,
+    neutral_losses: &[NeutralLossKind],
 ) -> anyhow::Result<DiaPeptideTarget> {
     let context = prepare_annotation(
         peptide_input,
         mod_inputs,
-        &[],
+        neutral_losses,
         charge_override,
         MassTolerance::Ppm(DEFAULT_MZ_PPM),
     )?;
@@ -768,7 +971,7 @@ fn resolve_peptide_target(
         .precursor_mz(charge)
         .ok_or_else(|| anyhow::anyhow!("failed to compute peptide precursor m/z"))?;
     let charges = fragment_charge_states(Some(charge));
-    let fragments = generate_fragments(&context.peptide, &charges, &[])
+    let fragments = generate_fragments(&context.peptide, &charges, neutral_losses)
         .into_iter()
         .map(dia_fragment_target)
         .collect::<Vec<_>>();
@@ -828,6 +1031,8 @@ fn dia_fragment_target(fragment: FragmentIon) -> DiaFragmentTarget {
         input: label.clone(),
         label,
         series: fragment_series_label(fragment.series).to_string(),
+        cleavage_index: fragment.cleavage_index,
+        neutral_loss: fragment.neutral_loss,
         charge: fragment.charge,
         mz: fragment.theoretical_mz,
     }
@@ -935,6 +1140,8 @@ fn run_mzml_slice(
     out_prefix: &Path,
     mz_profile_bins: usize,
     pseudo_ms2: &PseudoMs2Options,
+    rt_smooth: bool,
+    rt_smooth_window: usize,
     verbosity: Verbosity,
     capabilities: DiaCapabilities,
 ) -> anyhow::Result<()> {
@@ -1029,7 +1236,15 @@ fn run_mzml_slice(
         intensity_column: None,
         vendor_runtime_path: None,
     };
-    write_outputs(&summary, request, &rt_rows, &mz_bins, None)?;
+    write_outputs(
+        &summary,
+        request,
+        &rt_rows,
+        &mz_bins,
+        None,
+        rt_smooth,
+        rt_smooth_window,
+    )?;
 
     verbosity.success(format_args!(
         "Wrote DIA slice outputs: {} ({} spectra considered, {} with signal, {} matched peaks)",
@@ -1049,6 +1264,8 @@ fn run_bruker_slice(
     backend: BrukerBackend,
     mz_profile_bins: usize,
     pseudo_ms2: &PseudoMs2Options,
+    rt_smooth: bool,
+    rt_smooth_window: usize,
     verbosity: Verbosity,
     out_prefix: &Path,
 ) -> anyhow::Result<()> {
@@ -1065,6 +1282,8 @@ fn run_bruker_slice(
             request,
             mz_profile_bins,
             pseudo_ms2,
+            rt_smooth,
+            rt_smooth_window,
             verbosity,
             out_prefix,
         ),
@@ -1074,6 +1293,8 @@ fn run_bruker_slice(
             bruker_so_override,
             python_override,
             mz_profile_bins,
+            rt_smooth,
+            rt_smooth_window,
             verbosity,
             out_prefix,
         ),
@@ -1083,6 +1304,8 @@ fn run_bruker_slice(
                 request,
                 mz_profile_bins,
                 pseudo_ms2,
+                rt_smooth,
+                rt_smooth_window,
                 verbosity,
                 out_prefix,
             ) {
@@ -1101,6 +1324,8 @@ fn run_bruker_slice(
                         bruker_so_override,
                         python_override,
                         mz_profile_bins,
+                        rt_smooth,
+                        rt_smooth_window,
                         verbosity,
                         out_prefix,
                     )
@@ -1120,6 +1345,8 @@ fn run_bruker_slice_timsrust(
     request: &DiaSliceRequest,
     mz_profile_bins: usize,
     pseudo_ms2: &PseudoMs2Options,
+    rt_smooth: bool,
+    rt_smooth_window: usize,
     verbosity: Verbosity,
     out_prefix: &Path,
 ) -> anyhow::Result<()> {
@@ -1128,7 +1355,7 @@ fn run_bruker_slice_timsrust(
         "DIA slice: reading Bruker .d with timsrust and extracting m/z {:.6}-{:.6}",
         mz_min, mz_max
     ));
-    let payload = build_timsrust_bruker_payload(path, request, mz_profile_bins)?;
+    let payload = build_timsrust_bruker_payload(path, request, mz_profile_bins, verbosity)?;
     verbosity.detail(format_args!(
         "DIA slice: native extraction yielded {} frames with signal from {} considered frames",
         payload.frames_with_signal, payload.frames_considered
@@ -1148,6 +1375,8 @@ fn run_bruker_slice_timsrust(
         false,
         None,
         payload,
+        rt_smooth,
+        rt_smooth_window,
     )?;
     if pseudo_ms2.enabled {
         verbosity.status(format_args!(
@@ -1180,6 +1409,8 @@ fn run_bruker_slice_alphatims(
     bruker_so_override: Option<&Path>,
     python_override: Option<&Path>,
     mz_profile_bins: usize,
+    rt_smooth: bool,
+    rt_smooth_window: usize,
     verbosity: Verbosity,
     out_prefix: &Path,
 ) -> anyhow::Result<()> {
@@ -1212,6 +1443,8 @@ fn run_bruker_slice_alphatims(
         true,
         Some(runtime.path),
         payload,
+        rt_smooth,
+        rt_smooth_window,
     )?;
     print_bruker_success(out_prefix, &summary, verbosity);
     Ok(())
@@ -1226,6 +1459,8 @@ fn finish_bruker_slice_outputs(
     requires_vendor_runtime: bool,
     vendor_runtime_path: Option<PathBuf>,
     payload: BrukerBridgePayload,
+    rt_smooth: bool,
+    rt_smooth_window: usize,
 ) -> anyhow::Result<DiaSliceSummary> {
     if payload.matched_events == 0 {
         anyhow::bail!(
@@ -1287,7 +1522,15 @@ fn finish_bruker_slice_outputs(
         intensity_column: Some(payload.intensity_column),
         vendor_runtime_path,
     };
-    write_outputs(&summary, request, &rt_rows, &mz_bins, Some(&im_rows))?;
+    write_outputs(
+        &summary,
+        request,
+        &rt_rows,
+        &mz_bins,
+        Some(&im_rows),
+        rt_smooth,
+        rt_smooth_window,
+    )?;
     Ok(summary)
 }
 
@@ -1301,10 +1544,37 @@ fn print_bruker_success(out_prefix: &Path, summary: &DiaSliceSummary, verbosity:
     ));
 }
 
+fn collect_timsrust_ms2_frame_candidates<F>(
+    frame_reader: &FrameReader,
+    mut include_rt_seconds: F,
+) -> anyhow::Result<Vec<TimsrustFrameCandidate>>
+where
+    F: FnMut(f64) -> bool,
+{
+    let mut candidates = Vec::new();
+    for index in 0..frame_reader.len() {
+        let frame_meta = frame_reader
+            .get_frame_without_coordinates(index)
+            .with_context(|| format!("failed to inspect Bruker frame {}", index + 1))?;
+        if frame_meta.ms_level != MSLevel::MS2 {
+            continue;
+        }
+        if !include_rt_seconds(frame_meta.rt_in_seconds) {
+            continue;
+        }
+        candidates.push(TimsrustFrameCandidate {
+            reader_index: index,
+            rt_seconds: frame_meta.rt_in_seconds,
+        });
+    }
+    Ok(candidates)
+}
+
 fn build_timsrust_bruker_payload(
     path: &Path,
     request: &DiaSliceRequest,
     mz_profile_bins: usize,
+    verbosity: Verbosity,
 ) -> anyhow::Result<BrukerBridgePayload> {
     let metadata = MetadataReader::new(path)
         .with_context(|| "failed to read Bruker metadata with timsrust")?;
@@ -1341,22 +1611,26 @@ fn build_timsrust_bruker_payload(
     let mut matched_events = 0usize;
     let mut rt_profile = Vec::<BrukerBridgeRtRow>::new();
     let mut im_accumulator = BTreeMap::<usize, (f64, f64)>::new();
+    let total_frames = frame_reader.len();
+    let candidate_frames = collect_timsrust_ms2_frame_candidates(&frame_reader, |rt_seconds| {
+        rt_seconds_in_window(rt_seconds, request.rt_min, request.rt_max)
+    })?;
+    verbosity.detail(format_args!(
+        "DIA slice: scanning {} MS2 frames after RT filtering from {} total frames",
+        candidate_frames.len(),
+        total_frames
+    ));
+    let mut progress = ProgressReporter::new(
+        "DIA slice native MS2 frames",
+        candidate_frames.len(),
+        verbosity,
+    );
 
-    for index in 0..frame_reader.len() {
-        let frame_meta = frame_reader
-            .get_frame_without_coordinates(index)
-            .with_context(|| format!("failed to inspect Bruker frame {}", index + 1))?;
-        if frame_meta.ms_level != MSLevel::MS2 {
-            continue;
-        }
-        if !rt_seconds_in_window(frame_meta.rt_in_seconds, request.rt_min, request.rt_max) {
-            continue;
-        }
-
+    for candidate in candidate_frames {
         frames_considered += 1;
-        let frame = frame_reader
-            .get(index)
-            .with_context(|| format!("failed to read Bruker frame {}", index + 1))?;
+        let frame = frame_reader.get(candidate.reader_index).with_context(|| {
+            format!("failed to read Bruker frame {}", candidate.reader_index + 1)
+        })?;
         let mut frame_intensity = 0.0;
         let mut frame_events = 0usize;
 
@@ -1408,7 +1682,9 @@ fn build_timsrust_bruker_payload(
                 matched_events: frame_events,
             });
         }
+        progress.advance();
     }
+    progress.finish();
 
     let acquisition_mode = timsrust_acquisition_label(acquisition).to_string();
     let im_profile = im_accumulator
@@ -1490,6 +1766,8 @@ fn build_timsrust_pseudo_ms2(
             evidence: PseudoMs2FragmentEvidence {
                 label: fragment.label.clone(),
                 series: fragment.series.clone(),
+                cleavage_index: fragment.cleavage_index,
+                neutral_loss: fragment.neutral_loss,
                 charge: fragment.charge,
                 mz: fragment.mz,
                 summed_intensity: 0.0,
@@ -1509,25 +1787,29 @@ fn build_timsrust_pseudo_ms2(
     let mut frames_considered = 0usize;
     let mut frames_with_signal = 0usize;
     let mut matched_events = 0usize;
+    let total_frames = frame_reader.len();
+    let candidate_frames = collect_timsrust_ms2_frame_candidates(&frame_reader, |rt_seconds| {
+        let rt_minutes = rt_seconds / 60.0;
+        rt_minutes >= precursor_evidence.rt_window.min
+            && rt_minutes <= precursor_evidence.rt_window.max
+    })?;
+    verbosity.detail(format_args!(
+        "Pseudo-MS2: scanning {} MS2 frames after RT filtering from {} total frames",
+        candidate_frames.len(),
+        total_frames
+    ));
+    let mut progress = ProgressReporter::new(
+        "Pseudo-MS2 native MS2 frames",
+        candidate_frames.len(),
+        verbosity,
+    );
 
-    for index in 0..frame_reader.len() {
-        let frame_meta = frame_reader
-            .get_frame_without_coordinates(index)
-            .with_context(|| format!("failed to inspect Bruker frame {}", index + 1))?;
-        if frame_meta.ms_level != MSLevel::MS2 {
-            continue;
-        }
-        let rt_minutes = frame_meta.rt_in_seconds / 60.0;
-        if rt_minutes < precursor_evidence.rt_window.min
-            || rt_minutes > precursor_evidence.rt_window.max
-        {
-            continue;
-        }
-
+    for candidate in candidate_frames {
+        let rt_minutes = candidate.rt_seconds / 60.0;
         frames_considered += 1;
-        let frame = frame_reader
-            .get(index)
-            .with_context(|| format!("failed to read Bruker frame {}", index + 1))?;
+        let frame = frame_reader.get(candidate.reader_index).with_context(|| {
+            format!("failed to read Bruker frame {}", candidate.reader_index + 1)
+        })?;
         let mut frame_intensities = vec![0.0_f64; accumulators.len()];
         let mut frame_events = vec![0usize; accumulators.len()];
 
@@ -1583,7 +1865,9 @@ fn build_timsrust_pseudo_ms2(
         if frame_has_signal {
             frames_with_signal += 1;
         }
+        progress.advance();
     }
+    progress.finish();
 
     Ok(PseudoMs2Report {
         input_path: path.to_path_buf(),
@@ -2063,6 +2347,8 @@ fn write_outputs(
     rt_rows: &[RtProfileRow],
     mz_bins: &[MzProfileBin],
     im_rows: Option<&[MobilityProfileRow]>,
+    rt_smooth: bool,
+    rt_smooth_window: usize,
 ) -> anyhow::Result<()> {
     if let Some(parent) = summary.out_prefix.parent() {
         if !parent.as_os_str().is_empty() {
@@ -2075,7 +2361,15 @@ fn write_outputs(
     write_rt_profile(summary, rt_rows)?;
     write_mz_profile(summary, mz_bins)?;
     write_im_profile(summary, im_rows)?;
-    write_summary_svg(summary, request, rt_rows, mz_bins, im_rows)?;
+    write_summary_svg(
+        summary,
+        request,
+        rt_rows,
+        mz_bins,
+        im_rows,
+        rt_smooth,
+        rt_smooth_window,
+    )?;
     Ok(())
 }
 
@@ -2150,8 +2444,18 @@ fn write_pseudo_ms2_tsv(report: &PseudoMs2Report) -> anyhow::Result<()> {
 fn write_pseudo_ms2_svg(report: &PseudoMs2Report) -> anyhow::Result<()> {
     let path = output_path(&report.out_prefix, "pseudo_ms2.svg");
     let mut svg = String::new();
+    let table_rows = build_pseudo_ion_table_rows(report);
+    let neutral_loss_cutoff = pseudo_ms2_neutral_loss_display_cutoff(&report.fragments);
+    let table_width = pseudo_ion_table_width(&table_rows);
+    let table_height = pseudo_ion_table_height(table_rows.len());
+    let plot_left = 96.0;
+    let plot_top = 210.0;
+    let plot_width = 1094.0;
+    let plot_height = 410.0;
+    let table_left = SVG_MARGIN_X;
+    let table_top = plot_top + plot_height + 104.0;
     let width = SVG_WIDTH;
-    let height = 820u32;
+    let height = (table_top + table_height + 72.0).max(820.0).ceil() as u32;
     let _ = writeln!(
         svg,
         "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w}\" height=\"{h}\" viewBox=\"0 0 {w} {h}\">",
@@ -2235,21 +2539,522 @@ fn write_pseudo_ms2_svg(report: &PseudoMs2Report) -> anyhow::Result<()> {
 
     let x_domain = padded_range(report.fragments.iter().map(|row| row.mz));
     let y_domain = padded_y_range(report.fragments.iter().map(|row| row.summed_intensity));
-    let canvas = SvgCanvas::new(96.0, 210.0, 1094.0, 410.0, x_domain, y_domain);
+    let canvas = SvgCanvas::new(
+        plot_left,
+        plot_top,
+        plot_width,
+        plot_height,
+        x_domain,
+        y_domain,
+    );
     draw_pseudo_ms2_axes(&mut svg, canvas, x_domain, y_domain);
-    draw_pseudo_ms2_sticks(&mut svg, canvas, &report.fragments);
+    draw_pseudo_ms2_sticks(&mut svg, canvas, &report.fragments, neutral_loss_cutoff);
     draw_pseudo_ms2_legend(&mut svg, canvas.right() - 210.0, canvas.top() - 26.0);
-
-    let _ = writeln!(
-        svg,
-        "<text x=\"{:.2}\" y=\"{:.2}\" font-size=\"14\" fill=\"{}\" font-family=\"Menlo, Consolas, Liberation Mono, monospace\">grey ticks are theoretical fragments with no detected signal in the bounded DIA evidence window</text>",
-        canvas.left(),
-        canvas.bottom() + 86.0,
-        COLOR_SUBTLE
+    draw_pseudo_ms2_ion_table(
+        &mut svg,
+        table_left,
+        table_top,
+        table_width,
+        table_height,
+        &table_rows,
+        &report.peptide.sequence,
+        neutral_loss_cutoff,
     );
     svg.push_str("</svg>\n");
     fs::write(&path, svg).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
+}
+
+fn build_pseudo_ion_table_rows(report: &PseudoMs2Report) -> Vec<PseudoIonTableRow> {
+    let mut by_key = BTreeMap::<(&str, usize, u8), Vec<&PseudoMs2FragmentEvidence>>::new();
+    for fragment in &report.fragments {
+        by_key
+            .entry((
+                fragment.series.as_str(),
+                fragment.cleavage_index,
+                fragment.charge,
+            ))
+            .or_default()
+            .push(fragment);
+    }
+
+    let residue_count = report.peptide.sequence.chars().count();
+    let mut rows = Vec::with_capacity(residue_count.saturating_sub(1));
+    for cleavage_index in 1..residue_count {
+        rows.push(PseudoIonTableRow {
+            cleavage_index,
+            y_ordinal: residue_count - cleavage_index,
+            b1: build_pseudo_ion_table_cell_entries(&by_key, "b", cleavage_index, 1),
+            b2: build_pseudo_ion_table_cell_entries(&by_key, "b", cleavage_index, 2),
+            y1: build_pseudo_ion_table_cell_entries(&by_key, "y", cleavage_index, 1),
+            y2: build_pseudo_ion_table_cell_entries(&by_key, "y", cleavage_index, 2),
+        });
+    }
+    rows
+}
+
+fn build_pseudo_ion_table_cell_entries(
+    by_key: &BTreeMap<(&str, usize, u8), Vec<&PseudoMs2FragmentEvidence>>,
+    series: &'static str,
+    cleavage_index: usize,
+    charge: u8,
+) -> Vec<PseudoIonTableCell> {
+    let mut fragments = by_key
+        .get(&(series, cleavage_index, charge))
+        .cloned()
+        .unwrap_or_default();
+    fragments.sort_by(|left, right| {
+        neutral_loss_rank(left.neutral_loss)
+            .cmp(&neutral_loss_rank(right.neutral_loss))
+            .then_with(|| {
+                right
+                    .summed_intensity
+                    .partial_cmp(&left.summed_intensity)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                left.mz
+                    .partial_cmp(&right.mz)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+    fragments
+        .into_iter()
+        .map(pseudo_ion_table_cell)
+        .collect::<Vec<_>>()
+}
+
+fn pseudo_ion_table_cell(fragment: &PseudoMs2FragmentEvidence) -> PseudoIonTableCell {
+    PseudoIonTableCell {
+        label: fragment.label.clone(),
+        series: fragment.series.clone(),
+        neutral_loss: fragment.neutral_loss,
+        mz: fragment.mz,
+        summed_intensity: fragment.summed_intensity,
+        matched_events: fragment.matched_events,
+        frames_with_signal: fragment.frames_with_signal,
+        apex_rt: fragment.apex_rt,
+    }
+}
+
+fn pseudo_ms2_neutral_loss_display_cutoff(fragments: &[PseudoMs2FragmentEvidence]) -> f64 {
+    let max_base_intensity = fragments
+        .iter()
+        .filter(|fragment| fragment.neutral_loss.is_none())
+        .map(|fragment| fragment.summed_intensity)
+        .filter(|intensity| intensity.is_finite() && *intensity > 0.0)
+        .fold(0.0, f64::max);
+    let max_intensity = if max_base_intensity > 0.0 {
+        max_base_intensity
+    } else {
+        fragments
+            .iter()
+            .map(|fragment| fragment.summed_intensity)
+            .filter(|intensity| intensity.is_finite() && *intensity > 0.0)
+            .fold(0.0, f64::max)
+    };
+    max_intensity * PSEUDO_MS2_NEUTRAL_LOSS_MIN_RELATIVE_INTENSITY
+}
+
+fn pseudo_ms2_neutral_loss_signal_is_visible(
+    summed_intensity: f64,
+    neutral_loss: Option<NeutralLossKind>,
+    neutral_loss_cutoff: f64,
+) -> bool {
+    neutral_loss.is_none()
+        || (summed_intensity.is_finite()
+            && summed_intensity > 0.0
+            && summed_intensity >= neutral_loss_cutoff)
+}
+
+fn pseudo_ion_table_has_charge2(rows: &[PseudoIonTableRow]) -> bool {
+    rows.iter()
+        .any(|row| !row.b2.is_empty() || !row.y2.is_empty())
+}
+
+fn pseudo_ion_table_width(_rows: &[PseudoIonTableRow]) -> f64 {
+    SVG_WIDTH as f64 - 2.0 * SVG_MARGIN_X
+}
+
+fn pseudo_ion_table_height(row_count: usize) -> f64 {
+    112.0 + row_count as f64 * pseudo_ion_table_row_height(row_count) + 68.0
+}
+
+fn pseudo_ion_table_row_height(row_count: usize) -> f64 {
+    if row_count <= 18 {
+        31.0
+    } else if row_count <= 32 {
+        28.0
+    } else {
+        24.0
+    }
+}
+
+fn pseudo_ion_table_font_size(row_count: usize) -> f64 {
+    if row_count <= 18 {
+        16.0
+    } else if row_count <= 32 {
+        14.0
+    } else {
+        12.0
+    }
+}
+
+fn draw_pseudo_ms2_ion_table(
+    svg: &mut String,
+    left: f64,
+    top: f64,
+    width: f64,
+    height: f64,
+    rows: &[PseudoIonTableRow],
+    sequence: &str,
+    neutral_loss_cutoff: f64,
+) {
+    let row_height = pseudo_ion_table_row_height(rows.len());
+    let font_size = pseudo_ion_table_font_size(rows.len());
+    let show_charge2 = pseudo_ion_table_has_charge2(rows);
+    let pad = 18.0;
+    let title_y = top + 24.0;
+    let meta_y = top + 47.0;
+    let meta2_y = top + 66.0;
+    let header_y = top + 96.0;
+    let row_start_y = top + 125.0;
+    let table_bottom = top + height;
+
+    let _ = writeln!(
+        svg,
+        "<rect x=\"{left:.2}\" y=\"{top:.2}\" width=\"{width:.2}\" height=\"{height:.2}\" rx=\"12\" fill=\"#fbfdff\" stroke=\"{}\" stroke-width=\"1\"/>",
+        COLOR_CARD_BORDER
+    );
+    let _ = writeln!(
+        svg,
+        "<text x=\"{:.2}\" y=\"{:.2}\" font-size=\"18\" fill=\"{}\" font-family=\"Menlo, Consolas, Liberation Mono, monospace\">Pseudo-MS2 ion table</text>",
+        left + pad,
+        title_y,
+        COLOR_TEXT
+    );
+    let _ = writeln!(
+        svg,
+        "<text x=\"{:.2}\" y=\"{:.2}\" font-size=\"13\" fill=\"{}\" font-family=\"Menlo, Consolas, Liberation Mono, monospace\">color = DIA evidence; grey = theoretical base ion</text>",
+        left + pad,
+        meta_y,
+        COLOR_SUBTLE
+    );
+    let _ = writeln!(
+        svg,
+        "<text x=\"{:.2}\" y=\"{:.2}\" font-size=\"13\" fill=\"{}\" font-family=\"Menlo, Consolas, Liberation Mono, monospace\">suffixes: +p = -H3PO4 phosphoric acid loss; +w = -H2O water loss; +n = -NH3 ammonia loss</text>",
+        left + pad,
+        meta2_y,
+        COLOR_SUBTLE
+    );
+
+    draw_pseudo_ion_table_block(
+        svg,
+        left + pad,
+        width - pad * 2.0,
+        header_y,
+        row_start_y,
+        row_height,
+        font_size,
+        show_charge2,
+        rows,
+        neutral_loss_cutoff,
+    );
+
+    let _ = writeln!(
+        svg,
+        "<text x=\"{:.2}\" y=\"{:.2}\" font-size=\"13\" fill=\"{}\" font-family=\"Menlo, Consolas, Liberation Mono, monospace\">sequence: {}</text>",
+        left + pad,
+        table_bottom - 40.0,
+        COLOR_SUBTLE,
+        escape_xml(sequence)
+    );
+    let _ = writeln!(
+        svg,
+        "<text x=\"{:.2}\" y=\"{:.2}\" font-size=\"13\" fill=\"{}\" font-family=\"Menlo, Consolas, Liberation Mono, monospace\">neutral losses with at least {:.0}% of max fragment signal</text>",
+        left + pad,
+        table_bottom - 16.0,
+        COLOR_SUBTLE,
+        PSEUDO_MS2_NEUTRAL_LOSS_MIN_RELATIVE_INTENSITY * 100.0
+    );
+}
+
+fn draw_pseudo_ion_table_block(
+    svg: &mut String,
+    left: f64,
+    width: f64,
+    header_y: f64,
+    row_start_y: f64,
+    row_height: f64,
+    font_size: f64,
+    show_charge2: bool,
+    rows: &[PseudoIonTableRow],
+    neutral_loss_cutoff: f64,
+) {
+    let cut_width = 58.0;
+    let column_gap = 14.0;
+    let value_columns = if show_charge2 { 4.0 } else { 2.0 };
+    let value_width = (width - cut_width - column_gap * value_columns) / value_columns;
+
+    let mut cursor = left;
+    let b2_right = if show_charge2 {
+        let right = cursor + value_width;
+        cursor = right + column_gap;
+        Some(right)
+    } else {
+        None
+    };
+    let b1_right = cursor + value_width;
+    cursor = b1_right + column_gap;
+    let cut_left = cursor;
+    let cut_center = cut_left + cut_width / 2.0;
+    cursor = cut_left + cut_width + column_gap;
+    let y1_left = cursor;
+    cursor = y1_left + value_width + column_gap;
+    let y2_left = show_charge2.then_some(cursor);
+
+    let mut headers = Vec::new();
+    if let Some(x) = b2_right {
+        headers.push(("b++", x, "end"));
+    }
+    headers.push(("b+", b1_right, "end"));
+    headers.push(("cut", cut_center, "middle"));
+    headers.push(("y+", y1_left, "start"));
+    if let Some(x) = y2_left {
+        headers.push(("y++", x, "start"));
+    }
+    for (label, x, anchor) in headers {
+        let _ = writeln!(
+            svg,
+            "<text x=\"{x:.2}\" y=\"{header_y:.2}\" font-size=\"12\" fill=\"{}\" text-anchor=\"{anchor}\" font-family=\"Menlo, Consolas, Liberation Mono, monospace\">{label}</text>",
+            COLOR_AXIS
+        );
+    }
+    let _ = writeln!(
+        svg,
+        "<line x1=\"{:.2}\" y1=\"{:.2}\" x2=\"{:.2}\" y2=\"{:.2}\" stroke=\"{}\" stroke-width=\"1\"/>",
+        left,
+        header_y + 8.0,
+        left + width,
+        header_y + 8.0,
+        COLOR_GRID
+    );
+
+    for (idx, row) in rows.iter().enumerate() {
+        let y = row_start_y + idx as f64 * row_height;
+        if idx > 0 {
+            let _ = writeln!(
+                svg,
+                "<line x1=\"{:.2}\" y1=\"{:.2}\" x2=\"{:.2}\" y2=\"{:.2}\" stroke=\"#eef2f6\" stroke-width=\"1\"/>",
+                left,
+                y - row_height / 2.0 + 3.0,
+                left + width,
+                y - row_height / 2.0 + 3.0
+            );
+        }
+        if let Some(x) = b2_right {
+            write_pseudo_ion_cell(
+                svg,
+                x,
+                y,
+                "end",
+                font_size,
+                value_width,
+                &row.b2,
+                neutral_loss_cutoff,
+            );
+        }
+        write_pseudo_ion_cell(
+            svg,
+            b1_right,
+            y,
+            "end",
+            font_size,
+            value_width,
+            &row.b1,
+            neutral_loss_cutoff,
+        );
+        let _ = writeln!(
+            svg,
+            "<text x=\"{cut_center:.2}\" y=\"{y:.2}\" font-size=\"{font_size:.1}\" fill=\"{}\" text-anchor=\"middle\" font-family=\"Menlo, Consolas, Liberation Mono, monospace\"><title>{}</title>{}|{}</text>",
+            COLOR_SUBTLE,
+            escape_xml(&format!(
+                "b{} / y{} cleavage",
+                row.cleavage_index, row.y_ordinal
+            )),
+            row.cleavage_index,
+            row.y_ordinal
+        );
+        write_pseudo_ion_cell(
+            svg,
+            y1_left,
+            y,
+            "start",
+            font_size,
+            value_width,
+            &row.y1,
+            neutral_loss_cutoff,
+        );
+        if let Some(x) = y2_left {
+            write_pseudo_ion_cell(
+                svg,
+                x,
+                y,
+                "start",
+                font_size,
+                value_width,
+                &row.y2,
+                neutral_loss_cutoff,
+            );
+        }
+    }
+}
+
+fn write_pseudo_ion_cell(
+    svg: &mut String,
+    x: f64,
+    y: f64,
+    anchor: &str,
+    font_size: f64,
+    max_width: f64,
+    entries: &[PseudoIonTableCell],
+    neutral_loss_cutoff: f64,
+) {
+    if entries.is_empty() {
+        return;
+    }
+    let color = entries
+        .iter()
+        .find(|entry| {
+            entry.detected()
+                && pseudo_ms2_neutral_loss_signal_is_visible(
+                    entry.summed_intensity,
+                    entry.neutral_loss,
+                    neutral_loss_cutoff,
+                )
+        })
+        .or_else(|| entries.first())
+        .map(|entry| {
+            if entry.detected()
+                && pseudo_ms2_neutral_loss_signal_is_visible(
+                    entry.summed_intensity,
+                    entry.neutral_loss,
+                    neutral_loss_cutoff,
+                )
+            {
+                pseudo_ms2_series_color(&entry.series)
+            } else {
+                "#aeb8c4"
+            }
+        })
+        .unwrap_or("#aeb8c4");
+    let title = entries
+        .iter()
+        .map(|entry| {
+            format!(
+                "{} theoretical {:.4} | summed {:.3e} | events {} | frames {} | apex RT {}",
+                entry.label,
+                entry.mz,
+                entry.summed_intensity,
+                entry.matched_events,
+                entry.frames_with_signal,
+                format_optional_f64(entry.apex_rt, 3)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let budget = mono_char_budget(font_size, max_width);
+    let text = pseudo_ion_table_visible_text(entries, budget, neutral_loss_cutoff);
+    let _ = writeln!(
+        svg,
+        "<text x=\"{x:.2}\" y=\"{y:.2}\" font-size=\"{font_size:.1}\" fill=\"{color}\" text-anchor=\"{anchor}\" font-family=\"Menlo, Consolas, Liberation Mono, monospace\"><title>{}</title>{}</text>",
+        escape_xml(&title),
+        escape_xml(&text)
+    );
+}
+
+fn pseudo_ion_table_visible_text(
+    entries: &[PseudoIonTableCell],
+    budget: usize,
+    neutral_loss_cutoff: f64,
+) -> String {
+    if budget == 0 {
+        return String::new();
+    }
+    let mut parts = Vec::new();
+    if let Some(base) = entries.iter().find(|entry| entry.neutral_loss.is_none()) {
+        parts.push(format!("{:.2}", base.mz));
+        parts.extend(
+            entries
+                .iter()
+                .filter(|entry| {
+                    entry.neutral_loss.is_some()
+                        && entry.detected()
+                        && pseudo_ms2_neutral_loss_signal_is_visible(
+                            entry.summed_intensity,
+                            entry.neutral_loss,
+                            neutral_loss_cutoff,
+                        )
+                })
+                .filter_map(|entry| {
+                    entry
+                        .neutral_loss
+                        .map(|loss| format!("+{}", neutral_loss_short_label(loss)))
+                }),
+        );
+    } else {
+        parts.extend(
+            entries
+                .iter()
+                .filter(|entry| {
+                    entry.neutral_loss.is_none()
+                        || pseudo_ms2_neutral_loss_signal_is_visible(
+                            entry.summed_intensity,
+                            entry.neutral_loss,
+                            neutral_loss_cutoff,
+                        )
+                })
+                .map(pseudo_ion_table_entry_text),
+        );
+    }
+    let text = parts.join(" ");
+    if entries.iter().any(|entry| {
+        entry.neutral_loss.is_some()
+            && entry.detected()
+            && !pseudo_ms2_neutral_loss_signal_is_visible(
+                entry.summed_intensity,
+                entry.neutral_loss,
+                neutral_loss_cutoff,
+            )
+    }) {
+        truncate_end(&format!("{text} ..."), budget)
+    } else {
+        truncate_end(&text, budget)
+    }
+}
+
+fn pseudo_ion_table_entry_text(entry: &PseudoIonTableCell) -> String {
+    match entry.neutral_loss {
+        Some(loss) => format!("{}{:.2}", neutral_loss_short_label(loss), entry.mz),
+        None => format!("{:.2}", entry.mz),
+    }
+}
+
+fn neutral_loss_rank(loss: Option<NeutralLossKind>) -> u8 {
+    match loss {
+        None => 0,
+        Some(NeutralLossKind::PhosphoricAcid) => 1,
+        Some(NeutralLossKind::Water) => 2,
+        Some(NeutralLossKind::Ammonia) => 3,
+    }
+}
+
+fn neutral_loss_short_label(loss: NeutralLossKind) -> &'static str {
+    match loss {
+        NeutralLossKind::Water => "w",
+        NeutralLossKind::Ammonia => "n",
+        NeutralLossKind::PhosphoricAcid => "p",
+    }
 }
 
 fn draw_pseudo_ms2_axes(
@@ -2344,32 +3149,20 @@ fn draw_pseudo_ms2_sticks(
     svg: &mut String,
     canvas: SvgCanvas,
     fragments: &[PseudoMs2FragmentEvidence],
+    neutral_loss_cutoff: f64,
 ) {
     let baseline = canvas.y(0.0);
-    let mut ranked = fragments
-        .iter()
-        .filter(|row| row.summed_intensity > 0.0)
-        .collect::<Vec<_>>();
-    ranked.sort_by(|left, right| {
-        right
-            .summed_intensity
-            .partial_cmp(&left.summed_intensity)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let label_cutoff = ranked
-        .get(9)
-        .map(|row| row.summed_intensity)
-        .unwrap_or(f64::INFINITY);
 
-    for row in fragments {
+    for (idx, row) in fragments.iter().enumerate() {
+        if !pseudo_ms2_neutral_loss_signal_is_visible(
+            row.summed_intensity,
+            row.neutral_loss,
+            neutral_loss_cutoff,
+        ) {
+            continue;
+        }
         let x = canvas.x(row.mz);
         if row.summed_intensity <= 0.0 {
-            let _ = writeln!(
-                svg,
-                "<line x1=\"{x:.2}\" y1=\"{y1:.2}\" x2=\"{x:.2}\" y2=\"{y2:.2}\" stroke=\"#aeb8c4\" stroke-width=\"1.1\"/>",
-                y1 = baseline,
-                y2 = baseline - 9.0
-            );
             continue;
         }
         let y = canvas.y(row.summed_intensity);
@@ -2385,15 +3178,15 @@ fn draw_pseudo_ms2_sticks(
             row.mz,
             row.summed_intensity
         );
-        if row.summed_intensity >= label_cutoff {
-            let _ = writeln!(
-                svg,
-                "<text x=\"{x:.2}\" y=\"{label_y:.2}\" font-size=\"13\" text-anchor=\"middle\" fill=\"{}\" font-family=\"Menlo, Consolas, Liberation Mono, monospace\">{}</text>",
-                COLOR_TEXT,
-                escape_xml(&row.label),
-                label_y = (y - 10.0).max(canvas.top() + 14.0)
-            );
-        }
+        let label_y = (y - 10.0 - (idx % 4) as f64 * 13.0).max(canvas.top() + 14.0);
+        let _ = writeln!(
+            svg,
+            "<text x=\"{x:.2}\" y=\"{label_y:.2}\" font-size=\"12\" text-anchor=\"middle\" fill=\"{color}\" font-family=\"Menlo, Consolas, Liberation Mono, monospace\"><title>{}: {:.4} m/z, {:.3e}</title>{}</text>",
+            escape_xml(&row.label),
+            row.mz,
+            row.summed_intensity,
+            escape_xml(&row.label),
+        );
     }
 }
 
@@ -2534,6 +3327,8 @@ fn write_summary_svg(
     rt_rows: &[RtProfileRow],
     mz_bins: &[MzProfileBin],
     im_rows: Option<&[MobilityProfileRow]>,
+    rt_smooth: bool,
+    rt_smooth_window: usize,
 ) -> anyhow::Result<()> {
     let path = output_path(&summary.out_prefix, "svg");
     let mut svg = String::new();
@@ -2576,7 +3371,8 @@ fn write_summary_svg(
             ),
         },
         None => format!(
-            "m/z {:.4}-{:.4} | RT {}",
+            "Target: m/z {:.4} (z=1) | window {:.4}-{:.4} | RT {}",
+            request.mz,
             summary.mz_min,
             summary.mz_max,
             request.rt_window_label(),
@@ -2659,6 +3455,9 @@ fn write_summary_svg(
     let panel_gap = if chart_count == 3 { 104.0 } else { 112.0 };
     let rt_x_domain = rt_x_domain(rt_rows);
     let rt_y_domain = padded_y_range(rt_rows.iter().map(|row| row.summed_intensity));
+    let rt_points = rt_points(rt_rows);
+    let rt_smoothed_points =
+        rt_smooth.then(|| gaussian_smooth_points(&rt_points, rt_smooth_window));
     let rt_canvas = SvgCanvas::new(
         margin_left,
         panel_top,
@@ -2698,7 +3497,8 @@ fn write_summary_svg(
         },
         AxisProps::new(AxisOrientation::Left, "summed intensity")
             .with_tick_label_style(AxisTickLabelStyle::Scientific(2)),
-        &rt_points(rt_rows),
+        &rt_points,
+        rt_smoothed_points.as_deref(),
         COLOR_RT,
     );
     if let Some(im_rows) = im_rows.filter(|rows| !rows.is_empty()) {
@@ -2723,6 +3523,7 @@ fn write_summary_svg(
             AxisProps::new(AxisOrientation::Left, "summed intensity")
                 .with_tick_label_style(AxisTickLabelStyle::Scientific(2)),
             &mobility_points(im_rows),
+            None,
             "#0f766e",
         );
     }
@@ -2737,6 +3538,7 @@ fn write_summary_svg(
         AxisProps::new(AxisOrientation::Left, "summed intensity")
             .with_tick_label_style(AxisTickLabelStyle::Scientific(2)),
         &mz_points(mz_bins),
+        None,
         COLOR_MZ,
     );
 
@@ -2754,6 +3556,7 @@ fn append_chart(
     x_axis: AxisProps,
     y_axis: AxisProps,
     points: &[(f64, f64)],
+    overlay_points: Option<&[(f64, f64)]>,
     color: &str,
 ) {
     let _ = writeln!(
@@ -2863,18 +3666,43 @@ fn append_chart(
         return;
     }
 
+    let path_data = chart_path_data(canvas, points);
+    let raw_opacity = if overlay_points.is_some() { 0.42 } else { 1.0 };
+    let raw_width = if overlay_points.is_some() { 1.4 } else { 2.2 };
+    let _ = writeln!(
+        svg,
+        "<path d=\"{}\" fill=\"none\" stroke=\"{}\" stroke-width=\"{:.1}\" stroke-opacity=\"{:.2}\" stroke-linejoin=\"round\" stroke-linecap=\"round\"/>",
+        path_data,
+        color,
+        raw_width,
+        raw_opacity,
+    );
+    if let Some(overlay_points) = overlay_points.filter(|points| points.len() > 1) {
+        let overlay_path = chart_path_data(canvas, overlay_points);
+        let _ = writeln!(
+            svg,
+            "<path d=\"{}\" fill=\"none\" stroke=\"{}\" stroke-width=\"3.2\" stroke-linejoin=\"round\" stroke-linecap=\"round\"/>",
+            overlay_path,
+            color
+        );
+        let _ = writeln!(
+            svg,
+            "<text x=\"{:.2}\" y=\"{:.2}\" font-size=\"12\" text-anchor=\"end\" fill=\"{}\" font-family=\"Menlo, Consolas, Liberation Mono, monospace\">smoothed overlay</text>",
+            canvas.right(),
+            canvas.top() - 16.0,
+            COLOR_SUBTLE
+        );
+    }
+}
+
+fn chart_path_data(canvas: SvgCanvas, points: &[(f64, f64)]) -> String {
     let mut path_data = String::new();
     for (idx, (x, y)) in points.iter().enumerate() {
         let (px, py) = canvas.transform(*x, *y);
         let command = if idx == 0 { 'M' } else { 'L' };
         let _ = write!(path_data, "{command}{px:.2},{py:.2} ");
     }
-    let _ = writeln!(
-        svg,
-        "<path d=\"{}\" fill=\"none\" stroke=\"{}\" stroke-width=\"2.2\" stroke-linejoin=\"round\" stroke-linecap=\"round\"/>",
-        path_data.trim_end(),
-        color
-    );
+    path_data.trim_end().to_string()
 }
 
 fn append_mono_text_lines(
@@ -3041,6 +3869,60 @@ fn truncate_middle(value: &str, max_chars: usize) -> String {
     format!("{left}...{right}")
 }
 
+fn truncate_end(value: &str, max_chars: usize) -> String {
+    let count = value.chars().count();
+    if count <= max_chars {
+        return value.to_string();
+    }
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+    let keep = max_chars - 3;
+    let prefix = value.chars().take(keep).collect::<String>();
+    format!("{prefix}...")
+}
+
+fn gaussian_smooth_points(points: &[(f64, f64)], window_points: usize) -> Vec<(f64, f64)> {
+    if points.len() < 3 || window_points <= 1 {
+        return points.to_vec();
+    }
+    let window = if window_points % 2 == 0 {
+        window_points + 1
+    } else {
+        window_points
+    }
+    .min(points.len().saturating_mul(2).saturating_sub(1));
+    let half = window / 2;
+    let sigma = (window as f64 / 3.0).max(1.0);
+    let two_sigma_sq = 2.0 * sigma * sigma;
+
+    points
+        .iter()
+        .enumerate()
+        .map(|(idx, (x, _))| {
+            let start = idx.saturating_sub(half);
+            let end = (idx + half + 1).min(points.len());
+            let mut weighted_sum = 0.0;
+            let mut weight_total = 0.0;
+            for (neighbor_idx, (_, y)) in points.iter().enumerate().take(end).skip(start) {
+                let distance = neighbor_idx.abs_diff(idx) as f64;
+                let mut weight = (-distance * distance / two_sigma_sq).exp();
+                if *y <= 0.0 {
+                    weight *= RT_SMOOTH_ZERO_WEIGHT;
+                }
+                weighted_sum += *y * weight;
+                weight_total += weight;
+            }
+            let smoothed = if weight_total > 0.0 {
+                weighted_sum / weight_total
+            } else {
+                0.0
+            };
+            (*x, smoothed)
+        })
+        .collect()
+}
+
 fn rt_x_domain(rt_rows: &[RtProfileRow]) -> CoordinateRange<f64> {
     let values = rt_rows
         .iter()
@@ -3172,7 +4054,11 @@ fn escape_xml(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+
+    use crate::annotate::NeutralLossKind;
+    use crate::scale::CoordinateRange;
+    use crate::svg_canvas::{AxisOrientation, AxisProps, SvgCanvas};
 
     use super::{
         accumulate_mz_bin, compact_display_path_with, initialize_mz_bins, padded_range, parse_args,
@@ -3238,6 +4124,14 @@ mod tests {
     }
 
     #[test]
+    fn progress_bar_body_scales_to_requested_width() {
+        assert_eq!(super::progress_bar_body(0, 10, 10), "..........");
+        assert_eq!(super::progress_bar_body(5, 10, 10), "=====.....");
+        assert_eq!(super::progress_bar_body(10, 10, 10), "==========");
+        assert_eq!(super::progress_percent(3, 4), 75);
+    }
+
+    #[test]
     fn parse_args_accepts_peptide_target_without_mz() {
         let options = parse_args(vec![
             "--mzml".into(),
@@ -3298,6 +4192,293 @@ mod tests {
             .fragments
             .iter()
             .any(|fragment| fragment.label == "b8"));
+    }
+
+    #[test]
+    fn parse_args_accepts_pseudo_ms2_with_neutral_loss_fragments() {
+        let options = parse_args(vec![
+            "--bruker".into(),
+            "run.d".into(),
+            "--peptide".into(),
+            "S[+79.9663]PEPTIDE/2".into(),
+            "--pseudo-ms2".into(),
+            "--neutral-losses".into(),
+        ])
+        .expect("pseudo-ms2 neutral-loss options parse");
+        assert!(options.neutral_losses_enabled);
+        let target = options
+            .request
+            .expect("request")
+            .peptide_target
+            .expect("peptide target");
+        assert!(target
+            .fragments
+            .iter()
+            .any(|fragment| fragment.label.contains("-H3PO4")));
+    }
+
+    #[test]
+    fn parse_args_rejects_neutral_losses_without_peptide() {
+        let err = parse_args(vec![
+            "--mzml".into(),
+            "demo.mzML".into(),
+            "--mz".into(),
+            "500".into(),
+            "--neutral-losses".into(),
+        ])
+        .expect_err("neutral losses without peptide should fail");
+        assert!(err
+            .to_string()
+            .contains("--neutral-losses requires --peptide"));
+    }
+
+    #[test]
+    fn parse_args_accepts_rt_smooth_window() {
+        let options = parse_args(vec![
+            "--mzml".into(),
+            "demo.mzML".into(),
+            "--mz".into(),
+            "500".into(),
+            "--rt-smooth-window".into(),
+            "5".into(),
+        ])
+        .expect("rt smoothing options parse");
+        assert!(options.rt_smooth);
+        assert_eq!(options.rt_smooth_window, 5);
+    }
+
+    #[test]
+    fn gaussian_smooth_points_preserves_x_and_reduces_spike() {
+        let points = vec![(0.0, 0.0), (1.0, 10.0), (2.0, 0.0)];
+        let smoothed = super::gaussian_smooth_points(&points, 3);
+        assert_eq!(smoothed.len(), points.len());
+        assert_eq!(smoothed[1].0, 1.0);
+        assert!(smoothed[1].1 > 6.0);
+        assert!(smoothed[1].1 < 10.0);
+        assert!(smoothed[0].1 > 0.0);
+    }
+
+    #[test]
+    fn append_chart_draws_smoothed_overlay_when_points_are_available() {
+        let canvas = SvgCanvas::new(
+            0.0,
+            0.0,
+            100.0,
+            80.0,
+            CoordinateRange::new(0.0, 2.0),
+            CoordinateRange::new(0.0, 10.0),
+        );
+        let points = vec![(0.0, 0.0), (1.0, 10.0), (2.0, 0.0)];
+        let smoothed = super::gaussian_smooth_points(&points, 3);
+        let mut svg = String::new();
+        super::append_chart(
+            &mut svg,
+            canvas,
+            CoordinateRange::new(0.0, 2.0),
+            CoordinateRange::new(0.0, 10.0),
+            "RT profile",
+            AxisProps::new(AxisOrientation::Bottom, "RT (min)"),
+            AxisProps::new(AxisOrientation::Left, "summed intensity"),
+            &points,
+            Some(&smoothed),
+            "#1d4ed8",
+        );
+        assert!(svg.contains("smoothed overlay"));
+        assert!(svg.contains("stroke-opacity=\"0.42\""));
+    }
+
+    #[test]
+    fn pseudo_ms2_ion_table_marks_y_ion_evidence() {
+        let peptide = super::resolve_peptide_target("PEPTIDE/3", None, &[], None, &[])
+            .expect("peptide target");
+        let fragments = peptide
+            .fragments
+            .iter()
+            .map(|fragment| super::PseudoMs2FragmentEvidence {
+                label: fragment.label.clone(),
+                series: fragment.series.clone(),
+                cleavage_index: fragment.cleavage_index,
+                neutral_loss: fragment.neutral_loss,
+                charge: fragment.charge,
+                mz: fragment.mz,
+                summed_intensity: if fragment.label == "y3" { 42.0 } else { 0.0 },
+                matched_events: if fragment.label == "y3" { 2 } else { 0 },
+                frames_with_signal: if fragment.label == "y3" { 1 } else { 0 },
+                apex_rt: if fragment.label == "y3" {
+                    Some(12.5)
+                } else {
+                    None
+                },
+                apex_intensity: if fragment.label == "y3" { 42.0 } else { 0.0 },
+            })
+            .collect::<Vec<_>>();
+        let report = super::PseudoMs2Report {
+            input_path: PathBuf::from("run.d"),
+            out_prefix: PathBuf::from("out"),
+            peptide,
+            rt_window: super::PseudoMs2RtWindow {
+                min: 12.0,
+                max: 13.0,
+                source: "test",
+            },
+            frames_considered: 1,
+            frames_with_signal: 1,
+            matched_events: 2,
+            precursor_frames_with_signal: 1,
+            precursor_apex_rt: Some(12.5),
+            precursor_apex_intensity: 100.0,
+            fragments,
+        };
+
+        let rows = super::build_pseudo_ion_table_rows(&report);
+        let row = rows.iter().find(|row| row.y_ordinal == 3).expect("y3 row");
+        assert!(row.y1.iter().any(super::PseudoIonTableCell::detected));
+        assert!(!row.b1.iter().any(super::PseudoIonTableCell::detected));
+
+        let mut svg = String::new();
+        let width = super::pseudo_ion_table_width(&rows);
+        let height = super::pseudo_ion_table_height(rows.len());
+        super::draw_pseudo_ms2_ion_table(
+            &mut svg,
+            0.0,
+            0.0,
+            width,
+            height,
+            &rows,
+            &report.peptide.sequence,
+            0.0,
+        );
+        assert!(svg.contains("Pseudo-MS2 ion table"));
+        assert!(svg.contains("color = DIA evidence"));
+        assert!(svg.contains("y3 theoretical"));
+        assert!(svg.contains("neutral losses with at least 3% of max fragment signal"));
+    }
+
+    #[test]
+    fn pseudo_ms2_ion_table_height_keeps_single_long_ladder() {
+        let row_height = super::pseudo_ion_table_row_height(13);
+        assert!((super::pseudo_ion_table_height(13) - (180.0 + 13.0 * row_height)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pseudo_ms2_stick_labels_include_low_intensity_fragments() {
+        let fragments = vec![
+            super::PseudoMs2FragmentEvidence {
+                label: "b1".to_string(),
+                series: "b".to_string(),
+                cleavage_index: 1,
+                neutral_loss: None,
+                charge: 1,
+                mz: 100.0,
+                summed_intensity: 1000.0,
+                matched_events: 10,
+                frames_with_signal: 5,
+                apex_rt: Some(1.0),
+                apex_intensity: 1000.0,
+            },
+            super::PseudoMs2FragmentEvidence {
+                label: "y1".to_string(),
+                series: "y".to_string(),
+                cleavage_index: 1,
+                neutral_loss: None,
+                charge: 1,
+                mz: 300.0,
+                summed_intensity: 1.0,
+                matched_events: 1,
+                frames_with_signal: 1,
+                apex_rt: Some(1.1),
+                apex_intensity: 1.0,
+            },
+            super::PseudoMs2FragmentEvidence {
+                label: "b2".to_string(),
+                series: "b".to_string(),
+                cleavage_index: 2,
+                neutral_loss: None,
+                charge: 1,
+                mz: 320.0,
+                summed_intensity: 0.0,
+                matched_events: 0,
+                frames_with_signal: 0,
+                apex_rt: None,
+                apex_intensity: 0.0,
+            },
+        ];
+        let canvas = SvgCanvas::new(
+            0.0,
+            0.0,
+            400.0,
+            200.0,
+            CoordinateRange::new(50.0, 350.0),
+            CoordinateRange::new(0.0, 1000.0),
+        );
+        let mut svg = String::new();
+        super::draw_pseudo_ms2_sticks(&mut svg, canvas, &fragments, 0.0);
+
+        assert!(svg.contains(">b1</text>"));
+        assert!(svg.contains(">y1</text>"));
+        assert!(!svg.contains(">b2</text>"));
+        assert!(!svg.contains("#aeb8c4"));
+    }
+
+    #[test]
+    fn pseudo_ms2_svg_hides_weak_neutral_loss_labels() {
+        let fragments = vec![
+            super::PseudoMs2FragmentEvidence {
+                label: "b1".to_string(),
+                series: "b".to_string(),
+                cleavage_index: 1,
+                neutral_loss: None,
+                charge: 1,
+                mz: 100.0,
+                summed_intensity: 1000.0,
+                matched_events: 10,
+                frames_with_signal: 5,
+                apex_rt: Some(1.0),
+                apex_intensity: 1000.0,
+            },
+            super::PseudoMs2FragmentEvidence {
+                label: "b1-H3PO4".to_string(),
+                series: "b".to_string(),
+                cleavage_index: 1,
+                neutral_loss: Some(NeutralLossKind::PhosphoricAcid),
+                charge: 1,
+                mz: 2.0,
+                summed_intensity: 10.0,
+                matched_events: 1,
+                frames_with_signal: 1,
+                apex_rt: Some(1.1),
+                apex_intensity: 10.0,
+            },
+            super::PseudoMs2FragmentEvidence {
+                label: "y1-H3PO4".to_string(),
+                series: "y".to_string(),
+                cleavage_index: 1,
+                neutral_loss: Some(NeutralLossKind::PhosphoricAcid),
+                charge: 1,
+                mz: 300.0,
+                summed_intensity: 50.0,
+                matched_events: 3,
+                frames_with_signal: 2,
+                apex_rt: Some(1.2),
+                apex_intensity: 50.0,
+            },
+        ];
+        let cutoff = super::pseudo_ms2_neutral_loss_display_cutoff(&fragments);
+        assert!((cutoff - 30.0).abs() < 1e-9);
+        let canvas = SvgCanvas::new(
+            0.0,
+            0.0,
+            400.0,
+            200.0,
+            CoordinateRange::new(0.0, 350.0),
+            CoordinateRange::new(0.0, 1000.0),
+        );
+        let mut svg = String::new();
+        super::draw_pseudo_ms2_sticks(&mut svg, canvas, &fragments, cutoff);
+
+        assert!(svg.contains(">b1</text>"));
+        assert!(svg.contains(">y1-H3PO4</text>"));
+        assert!(!svg.contains(">b1-H3PO4</text>"));
     }
 
     #[test]

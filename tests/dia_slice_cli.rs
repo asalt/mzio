@@ -62,6 +62,7 @@ fn dia_slice_help_mentions_runtime_and_slice_flags() {
     assert!(stdout.contains("--python <exe>"));
     assert!(stdout.contains("--peptide <SEQ>"));
     assert!(stdout.contains("--fragment <ion>"));
+    assert!(stdout.contains("--neutral-losses"));
     assert!(stdout.contains("--charge <int>"));
     assert!(stdout.contains("--pseudo-ms2"));
     assert!(stdout.contains("--pseudo-ms2-rt-window <min>"));
@@ -71,6 +72,8 @@ fn dia_slice_help_mentions_runtime_and_slice_flags() {
     assert!(stdout.contains("all windows"));
     assert!(stdout.contains("--quad-min <mz>"));
     assert!(stdout.contains("--outdir <dir>"));
+    assert!(stdout.contains("--rt-smooth"));
+    assert!(stdout.contains("--rt-smooth-window <n>"));
     assert!(stdout.contains("-v, --verbose"));
     assert!(stdout.contains("-q, --quiet"));
     assert!(stdout.contains("MZIO_BRUKER_SO"));
@@ -121,6 +124,7 @@ fn dia_slice_mzml_writes_profiles_and_svg() {
     let svg = fs::read_to_string(output_path(&out_prefix, "svg")).expect("read svg");
     assert!(svg.contains("Source:"));
     assert!(!svg.contains(&demo_mzml_path().display().to_string()));
+    assert!(svg.contains("Target: m/z 500.0000 (z=1)"));
     assert!(svg.contains("RT profile"));
     assert!(svg.contains("m/z profile"));
 
