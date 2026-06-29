@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt::Write as _;
 use std::fs::{self, File};
@@ -162,6 +162,12 @@ impl DiaSliceRequest {
 }
 
 #[derive(Clone, Debug)]
+struct DiaMzTarget {
+    label: String,
+    mz: f64,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct DiaPeptideTarget {
     pub(crate) input: String,
     pub(crate) sequence: String,
@@ -193,6 +199,7 @@ struct DiaSliceOptions {
     out_prefix: Option<PathBuf>,
     outdir: Option<PathBuf>,
     mz_profile_bins: usize,
+    mz_targets: Vec<DiaMzTarget>,
     peptide_input: Option<String>,
     fragment_input: Option<String>,
     mod_inputs: Vec<String>,
@@ -216,6 +223,7 @@ impl Default for DiaSliceOptions {
             out_prefix: None,
             outdir: None,
             mz_profile_bins: DEFAULT_MZ_PROFILE_BINS,
+            mz_targets: Vec::new(),
             peptide_input: None,
             fragment_input: None,
             mod_inputs: Vec::new(),
@@ -549,6 +557,18 @@ struct BrukerBridgeImRow {
     summed_intensity: f64,
 }
 
+struct TimsrustSliceAccumulator {
+    mz_min: f64,
+    mz_max: f64,
+    tof_min: u32,
+    tof_max: u32,
+    mz_bins: Vec<MzProfileBin>,
+    frames_with_signal: usize,
+    matched_events: usize,
+    rt_profile: Vec<BrukerBridgeRtRow>,
+    im_accumulator: BTreeMap<usize, (f64, f64)>,
+}
+
 pub fn run(args: Vec<String>) -> anyhow::Result<()> {
     if args
         .iter()
@@ -567,6 +587,9 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
         .request
         .as_ref()
         .expect("parse_args validates DIA request");
+    if !options.mz_targets.is_empty() {
+        return run_multi_target_slices(input, request, &options);
+    }
     let default_prefix = default_out_prefix(input, request);
     let file_prefix = options.out_prefix.clone().unwrap_or(default_prefix);
     let out_prefix = options
@@ -629,13 +652,66 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
     }
 }
 
+fn run_multi_target_slices(
+    input: &DiaInput,
+    base_request: &DiaSliceRequest,
+    options: &DiaSliceOptions,
+) -> anyhow::Result<()> {
+    let DiaInput::Bruker(path) = input else {
+        anyhow::bail!("repeatable --target currently supports native Bruker .d input only");
+    };
+    if options.bruker_backend == BrukerBackend::AlphaTims {
+        anyhow::bail!("repeatable --target requires --bruker-backend native or auto");
+    }
+
+    let requests = options
+        .mz_targets
+        .iter()
+        .map(|target| request_for_mz_target(base_request, target))
+        .collect::<Vec<_>>();
+    let out_prefixes = options
+        .mz_targets
+        .iter()
+        .map(|target| {
+            multi_target_out_prefix(
+                input,
+                options.outdir.as_ref(),
+                options.out_prefix.as_ref(),
+                target,
+            )
+        })
+        .collect::<Vec<_>>();
+    let target_labels = options
+        .mz_targets
+        .iter()
+        .map(|target| format!("{}={:.4}", target.label, target.mz))
+        .collect::<Vec<_>>()
+        .join(", ");
+    options.verbosity.status(format_args!(
+        "DIA slice: input={} targets={} output-count={}",
+        compact_display_path(input.path(), 72),
+        target_labels,
+        requests.len()
+    ));
+    run_bruker_multi_target_timsrust(
+        path,
+        &requests,
+        &out_prefixes,
+        options.mz_profile_bins,
+        options.rt_smooth,
+        options.rt_smooth_window,
+        options.verbosity,
+    )
+    .with_context(|| "native timsrust multi-target extraction failed")
+}
+
 fn print_help() {
     let program = crate::program_name();
     println!("{program} dia-slice");
     println!();
     println!("USAGE:");
     println!(
-        "  {program} dia-slice (--mzml <file> | --bruker <run.d>) (--mz <center> | --peptide <SEQ>) [options]"
+        "  {program} dia-slice (--mzml <file> | --bruker <run.d>) (--mz <center> | --peptide <SEQ> | --target <label:mz>...) [options]"
     );
     println!();
     println!("OPTIONS:");
@@ -645,6 +721,9 @@ fn print_help() {
     println!("  --bruker-backend <name>  Bruker backend: auto, native, alphatims [auto]");
     println!("  --python <exe>           Python interpreter for the alphaTims Bruker bridge");
     println!("  --mz <center>            Target fragment/signal m/z center");
+    println!(
+        "  --target <label:mz>      Repeatable raw m/z target for one-pass native Bruker extraction"
+    );
     println!("  --peptide <SEQ>          Peptide precursor target; supports inline mods and /charge suffix");
     println!("  --sequence <SEQ>         Alias for --peptide");
     println!("  --sequence-modi <SEQ>    Alias for --peptide");
@@ -753,6 +832,12 @@ fn parse_args(args: Vec<String>) -> anyhow::Result<DiaSliceOptions> {
             }
             "--mz" => {
                 mz = Some(parse_f64_flag("--mz", iter.next())?);
+            }
+            "--target" | "--mz-target" => {
+                let raw = iter
+                    .next()
+                    .with_context(|| format!("{arg} expects <label:mz>"))?;
+                options.mz_targets.push(parse_mz_target(&raw)?);
             }
             "--peptide" | "--sequence" | "--sequence-modi" | "--sequencemodi" => {
                 let peptide = iter
@@ -868,6 +953,26 @@ fn parse_args(args: Vec<String>) -> anyhow::Result<DiaSliceOptions> {
     let input = options.input.as_ref().ok_or_else(|| {
         anyhow::anyhow!("dia-slice requires exactly one of --mzml <file> or --bruker <run.d>")
     })?;
+    if !options.mz_targets.is_empty() {
+        if mz.is_some() {
+            anyhow::bail!("specify only one of --mz <center> or repeatable --target <label:mz>");
+        }
+        if options.peptide_input.is_some() {
+            anyhow::bail!("--target cannot be combined with --peptide");
+        }
+        if matches!(input, DiaInput::Mzml(_)) {
+            anyhow::bail!("repeatable --target currently supports native Bruker .d input only");
+        }
+        if options.bruker_backend == BrukerBackend::AlphaTims {
+            anyhow::bail!("repeatable --target requires --bruker-backend native or auto");
+        }
+        let mut seen = BTreeSet::new();
+        for target in &options.mz_targets {
+            if !seen.insert(target.label.clone()) {
+                anyhow::bail!("duplicate --target label `{}`", target.label);
+            }
+        }
+    }
     if options.peptide_input.is_none() && !options.mod_inputs.is_empty() {
         anyhow::bail!("--mod requires --peptide (or a sequence alias)");
     }
@@ -904,18 +1009,25 @@ fn parse_args(args: Vec<String>) -> anyhow::Result<DiaSliceOptions> {
             )
         })
         .transpose()?;
-    let mz = match (mz, peptide_target.as_ref()) {
-        (Some(_), Some(_)) => {
+    let mz = match (mz, peptide_target.as_ref(), options.mz_targets.first()) {
+        (Some(_), Some(_), _) => {
             anyhow::bail!("specify only one of --mz <center> or --peptide <SEQ>")
         }
-        (Some(value), None) => value,
-        (None, Some(target)) => target
+        (Some(_), None, Some(_)) => {
+            anyhow::bail!("specify only one of --mz <center> or repeatable --target <label:mz>")
+        }
+        (None, Some(_), Some(_)) => anyhow::bail!("--target cannot be combined with --peptide"),
+        (Some(value), None, None) => value,
+        (None, Some(target), None) => target
             .fragment
             .as_ref()
             .map(|fragment| fragment.mz)
             .unwrap_or(target.precursor_mz),
-        (None, None) => {
-            anyhow::bail!("dia-slice requires --mz <center> or --peptide <SEQ>")
+        (None, None, Some(target)) => target.mz,
+        (None, None, None) => {
+            anyhow::bail!(
+                "dia-slice requires --mz <center>, --peptide <SEQ>, or --target <label:mz>"
+            )
         }
     };
     if !mz.is_finite() {
@@ -1097,6 +1209,36 @@ fn parse_f64_flag(flag: &str, value: Option<String>) -> anyhow::Result<f64> {
         .with_context(|| format!("invalid {flag} value `{raw}`"))
 }
 
+fn parse_mz_target(raw: &str) -> anyhow::Result<DiaMzTarget> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("--target cannot be empty");
+    }
+    let (label_raw, mz_raw) = match trimmed.rsplit_once(':') {
+        Some((label, mz)) => {
+            if label.trim().is_empty() {
+                anyhow::bail!("--target label cannot be empty in `{raw}`");
+            }
+            (Some(label.trim()), mz.trim())
+        }
+        None => (None, trimmed),
+    };
+    let mz = mz_raw
+        .parse::<f64>()
+        .with_context(|| format!("invalid --target m/z value `{mz_raw}`"))?;
+    if mz <= 0.0 || !mz.is_finite() {
+        anyhow::bail!("--target m/z must be a positive finite number");
+    }
+    let label = label_raw
+        .map(sanitize_filename_component)
+        .unwrap_or_else(|| default_mz_target_label(mz));
+    Ok(DiaMzTarget { label, mz })
+}
+
+fn default_mz_target_label(mz: f64) -> String {
+    format!("mz_{mz:.4}")
+}
+
 fn parse_out_prefix(raw: &str) -> anyhow::Result<PathBuf> {
     let path = Path::new(raw);
     let has_one_normal_component = path.components().count() == 1 && path.file_name().is_some();
@@ -1142,6 +1284,39 @@ fn default_out_prefix(input: &DiaInput, request: &DiaSliceRequest) -> PathBuf {
         })
         .unwrap_or_else(|| format!("mz_{:.4}", request.mz));
     PathBuf::from(format!("{}.dia_slice_{}", input.default_stem(), target))
+}
+
+fn request_for_mz_target(base_request: &DiaSliceRequest, target: &DiaMzTarget) -> DiaSliceRequest {
+    let mut request = base_request.clone();
+    request.mz = target.mz;
+    request.peptide_target = None;
+    request
+}
+
+fn multi_target_out_prefix(
+    input: &DiaInput,
+    outdir: Option<&PathBuf>,
+    out_prefix: Option<&PathBuf>,
+    target: &DiaMzTarget,
+) -> PathBuf {
+    let file_prefix = out_prefix
+        .map(|base| {
+            let base = base
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("dia_slice");
+            PathBuf::from(format!("{base}__{}", target.label))
+        })
+        .unwrap_or_else(|| {
+            PathBuf::from(format!(
+                "{}.dia_slice_{}",
+                input.default_stem(),
+                target.label
+            ))
+        });
+    outdir
+        .map(|outdir| outdir.join(&file_prefix))
+        .unwrap_or(file_prefix)
 }
 
 fn request_target_label(request: &DiaSliceRequest) -> String {
@@ -1402,6 +1577,7 @@ fn run_bruker_slice_timsrust(
         false,
         None,
         payload,
+        false,
         rt_smooth,
         rt_smooth_window,
     )?;
@@ -1427,6 +1603,68 @@ fn run_bruker_slice_timsrust(
         ));
     }
     print_bruker_success(out_prefix, &summary, verbosity);
+    Ok(())
+}
+
+fn run_bruker_multi_target_timsrust(
+    path: &Path,
+    requests: &[DiaSliceRequest],
+    out_prefixes: &[PathBuf],
+    mz_profile_bins: usize,
+    rt_smooth: bool,
+    rt_smooth_window: usize,
+    verbosity: Verbosity,
+) -> anyhow::Result<()> {
+    if !path.is_dir() {
+        anyhow::bail!(
+            "Bruker input does not exist or is not a directory: {}",
+            path.display()
+        );
+    }
+    if requests.len() != out_prefixes.len() {
+        anyhow::bail!("internal error: target/output count mismatch");
+    }
+    let ranges = requests
+        .iter()
+        .map(|request| {
+            let (mz_min, mz_max) = request.mz_bounds();
+            format!("{mz_min:.4}-{mz_max:.4}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    verbosity.status(format_args!(
+        "DIA slice: reading Bruker .d with timsrust and extracting {} m/z target(s): {}",
+        requests.len(),
+        ranges
+    ));
+    let payloads = build_timsrust_bruker_payloads(path, requests, mz_profile_bins, verbosity)?;
+    let mut summaries = Vec::with_capacity(payloads.len());
+    for ((request, out_prefix), payload) in requests.iter().zip(out_prefixes).zip(payloads) {
+        let has_isolation_window = payload.acquisition_mode == "diaPASEF";
+        let summary = finish_bruker_slice_outputs(
+            path,
+            request,
+            out_prefix,
+            "Bruker .d (timsrust native)",
+            has_isolation_window,
+            false,
+            None,
+            payload,
+            true,
+            rt_smooth,
+            rt_smooth_window,
+        )?;
+        summaries.push(summary);
+    }
+    let matched_events = summaries
+        .iter()
+        .map(|summary| summary.matched_peaks)
+        .sum::<usize>();
+    verbosity.success(format_args!(
+        "Wrote DIA slice outputs for {} targets ({} total matched detector events)",
+        summaries.len(),
+        matched_events
+    ));
     Ok(())
 }
 
@@ -1470,6 +1708,7 @@ fn run_bruker_slice_alphatims(
         true,
         Some(runtime.path),
         payload,
+        false,
         rt_smooth,
         rt_smooth_window,
     )?;
@@ -1486,10 +1725,11 @@ fn finish_bruker_slice_outputs(
     requires_vendor_runtime: bool,
     vendor_runtime_path: Option<PathBuf>,
     payload: BrukerBridgePayload,
+    allow_empty: bool,
     rt_smooth: bool,
     rt_smooth_window: usize,
 ) -> anyhow::Result<DiaSliceSummary> {
-    if payload.matched_events == 0 {
+    if payload.matched_events == 0 && !allow_empty {
         anyhow::bail!(
             "no detector events matched the requested Bruker slice window (mz {:.4}-{:.4}, RT {}, IM {:?}-{:?}, quad {:?}-{:?})",
             payload.mz_min,
@@ -1603,49 +1843,52 @@ fn build_timsrust_bruker_payload(
     mz_profile_bins: usize,
     verbosity: Verbosity,
 ) -> anyhow::Result<BrukerBridgePayload> {
+    let mut payloads = build_timsrust_bruker_payloads(
+        path,
+        std::slice::from_ref(request),
+        mz_profile_bins,
+        verbosity,
+    )?;
+    payloads
+        .pop()
+        .ok_or_else(|| anyhow::anyhow!("native timsrust extraction produced no payload"))
+}
+
+fn build_timsrust_bruker_payloads(
+    path: &Path,
+    requests: &[DiaSliceRequest],
+    mz_profile_bins: usize,
+    verbosity: Verbosity,
+) -> anyhow::Result<Vec<BrukerBridgePayload>> {
+    let Some(base_request) = requests.first() else {
+        anyhow::bail!("native timsrust extraction requires at least one m/z target");
+    };
     let metadata = MetadataReader::new(path)
         .with_context(|| "failed to read Bruker metadata with timsrust")?;
     let frame_reader =
         FrameReader::new(path).with_context(|| "failed to open Bruker .d with timsrust")?;
     let acquisition = frame_reader.get_acquisition();
     if acquisition != AcquisitionType::DIAPASEF
-        && (request.quad_min.is_some() || request.quad_max.is_some())
+        && (base_request.quad_min.is_some() || base_request.quad_max.is_some())
     {
         anyhow::bail!(
             "native timsrust Bruker backend supports --quad-* filters only for diaPASEF data"
         );
     }
-    let (mz_min, mz_max) = request.mz_bounds();
-    let tof_min = metadata.mz_converter.invert(mz_min).floor().max(0.0);
-    let tof_max = metadata.mz_converter.invert(mz_max).ceil().max(0.0);
-    if !tof_min.is_finite() || !tof_max.is_finite() || tof_min > tof_max {
-        anyhow::bail!("timsrust produced invalid TOF bounds for requested m/z slice");
-    }
-    let tof_min = tof_min as u32;
-    let tof_max = tof_max as u32;
 
-    let mut mz_bins = vec![
-        MzProfileBin {
-            mz_center: 0.0,
-            summed_intensity: 0.0,
-        };
-        mz_profile_bins
-    ];
-    initialize_mz_histogram_bins(&mut mz_bins, mz_min, mz_max);
-
-    let mut frames_considered = 0usize;
-    let mut frames_with_signal = 0usize;
-    let mut matched_events = 0usize;
-    let mut rt_profile = Vec::<BrukerBridgeRtRow>::new();
-    let mut im_accumulator = BTreeMap::<usize, (f64, f64)>::new();
+    let mut accumulators = requests
+        .iter()
+        .map(|request| prepare_timsrust_slice_accumulator(&metadata, request, mz_profile_bins))
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let total_frames = frame_reader.len();
     let candidate_frames = collect_timsrust_ms2_frame_candidates(&frame_reader, |rt_seconds| {
-        rt_seconds_in_window(rt_seconds, request.rt_min, request.rt_max)
+        rt_seconds_in_window(rt_seconds, base_request.rt_min, base_request.rt_max)
     })?;
     verbosity.detail(format_args!(
-        "DIA slice: scanning {} MS2 frames after RT filtering from {} total frames",
+        "DIA slice: scanning {} MS2 frames after RT filtering from {} total frames for {} target(s)",
         candidate_frames.len(),
-        total_frames
+        total_frames,
+        accumulators.len()
     ));
     let mut progress = ProgressReporter::new(
         "DIA slice native MS2 frames",
@@ -1653,20 +1896,25 @@ fn build_timsrust_bruker_payload(
         verbosity,
     );
 
-    for candidate in candidate_frames {
-        frames_considered += 1;
+    let frames_considered = candidate_frames.len();
+    for candidate in candidate_frames.iter() {
         let frame = frame_reader.get(candidate.reader_index).with_context(|| {
             format!("failed to read Bruker frame {}", candidate.reader_index + 1)
         })?;
-        let mut frame_intensity = 0.0;
-        let mut frame_events = 0usize;
+        let mut frame_intensities = vec![0.0_f64; accumulators.len()];
+        let mut frame_events = vec![0usize; accumulators.len()];
 
         for scan_index in 0..frame.scan_offsets.len().saturating_sub(1) {
             let mobility = metadata.im_converter.convert(scan_index as u32);
-            if !mobility_in_window(mobility, request.im_min, request.im_max) {
+            if !mobility_in_window(mobility, base_request.im_min, base_request.im_max) {
                 continue;
             }
-            if !quad_in_window(&frame, scan_index, request.quad_min, request.quad_max) {
+            if !quad_in_window(
+                &frame,
+                scan_index,
+                base_request.quad_min,
+                base_request.quad_max,
+            ) {
                 continue;
             }
 
@@ -1676,52 +1924,110 @@ fn build_timsrust_bruker_payload(
                 continue;
             }
             let scan_tofs = &frame.tof_indices[start..end];
-            let peak_start = scan_tofs.partition_point(|tof| *tof < tof_min);
-            let peak_end = scan_tofs.partition_point(|tof| *tof <= tof_max);
+            for (target_idx, accumulator) in accumulators.iter_mut().enumerate() {
+                let peak_start = scan_tofs.partition_point(|tof| *tof < accumulator.tof_min);
+                let peak_end = scan_tofs.partition_point(|tof| *tof <= accumulator.tof_max);
 
-            for relative_peak_index in peak_start..peak_end {
-                let peak_index = start + relative_peak_index;
-                let mz = metadata.mz_converter.convert(frame.tof_indices[peak_index]);
-                if mz < mz_min || mz > mz_max {
-                    continue;
+                for relative_peak_index in peak_start..peak_end {
+                    let peak_index = start + relative_peak_index;
+                    let mz = metadata.mz_converter.convert(frame.tof_indices[peak_index]);
+                    if mz < accumulator.mz_min || mz > accumulator.mz_max {
+                        continue;
+                    }
+                    let intensity = frame.get_corrected_intensity(peak_index);
+                    if !intensity.is_finite() || intensity <= 0.0 {
+                        continue;
+                    }
+                    accumulator.matched_events += 1;
+                    frame_events[target_idx] += 1;
+                    frame_intensities[target_idx] += intensity;
+                    accumulate_mz_histogram_bin(
+                        &mut accumulator.mz_bins,
+                        accumulator.mz_min,
+                        accumulator.mz_max,
+                        mz,
+                        intensity,
+                    );
+                    accumulator
+                        .im_accumulator
+                        .entry(scan_index)
+                        .and_modify(|(_, summed_intensity)| *summed_intensity += intensity)
+                        .or_insert((mobility, intensity));
                 }
-                let intensity = frame.get_corrected_intensity(peak_index);
-                if !intensity.is_finite() || intensity <= 0.0 {
-                    continue;
-                }
-                matched_events += 1;
-                frame_events += 1;
-                frame_intensity += intensity;
-                accumulate_mz_histogram_bin(&mut mz_bins, mz_min, mz_max, mz, intensity);
-                im_accumulator
-                    .entry(scan_index)
-                    .and_modify(|(_, summed_intensity)| *summed_intensity += intensity)
-                    .or_insert((mobility, intensity));
             }
         }
 
-        if frame_events > 0 {
-            frames_with_signal += 1;
-            rt_profile.push(BrukerBridgeRtRow {
-                frame_index: frame.index as u32,
-                rt_minutes: frame.rt_in_seconds / 60.0,
-                summed_intensity: frame_intensity,
-                matched_events: frame_events,
-            });
+        for (target_idx, accumulator) in accumulators.iter_mut().enumerate() {
+            if frame_events[target_idx] > 0 {
+                accumulator.frames_with_signal += 1;
+                accumulator.rt_profile.push(BrukerBridgeRtRow {
+                    frame_index: frame.index as u32,
+                    rt_minutes: frame.rt_in_seconds / 60.0,
+                    summed_intensity: frame_intensities[target_idx],
+                    matched_events: frame_events[target_idx],
+                });
+            }
         }
         progress.advance();
     }
     progress.finish();
 
     let acquisition_mode = timsrust_acquisition_label(acquisition).to_string();
-    let im_profile = im_accumulator
+    Ok(accumulators
+        .into_iter()
+        .map(|accumulator| {
+            finalize_timsrust_slice_payload(accumulator, &acquisition_mode, frames_considered)
+        })
+        .collect())
+}
+
+fn prepare_timsrust_slice_accumulator(
+    metadata: &Metadata,
+    request: &DiaSliceRequest,
+    mz_profile_bins: usize,
+) -> anyhow::Result<TimsrustSliceAccumulator> {
+    let (mz_min, mz_max) = request.mz_bounds();
+    let tof_min = metadata.mz_converter.invert(mz_min).floor().max(0.0);
+    let tof_max = metadata.mz_converter.invert(mz_max).ceil().max(0.0);
+    if !tof_min.is_finite() || !tof_max.is_finite() || tof_min > tof_max {
+        anyhow::bail!("timsrust produced invalid TOF bounds for requested m/z slice");
+    }
+    let mut mz_bins = vec![
+        MzProfileBin {
+            mz_center: 0.0,
+            summed_intensity: 0.0,
+        };
+        mz_profile_bins
+    ];
+    initialize_mz_histogram_bins(&mut mz_bins, mz_min, mz_max);
+    Ok(TimsrustSliceAccumulator {
+        mz_min,
+        mz_max,
+        tof_min: tof_min as u32,
+        tof_max: tof_max as u32,
+        mz_bins,
+        frames_with_signal: 0,
+        matched_events: 0,
+        rt_profile: Vec::new(),
+        im_accumulator: BTreeMap::new(),
+    })
+}
+
+fn finalize_timsrust_slice_payload(
+    accumulator: TimsrustSliceAccumulator,
+    acquisition_mode: &str,
+    frames_considered: usize,
+) -> BrukerBridgePayload {
+    let im_profile = accumulator
+        .im_accumulator
         .into_iter()
         .map(|(_, (mobility, summed_intensity))| BrukerBridgeImRow {
             mobility,
             summed_intensity,
         })
         .collect::<Vec<_>>();
-    let mz_profile = mz_bins
+    let mz_profile = accumulator
+        .mz_bins
         .into_iter()
         .map(|bin| BrukerBridgeMzRow {
             mz_center: bin.mz_center,
@@ -1729,18 +2035,18 @@ fn build_timsrust_bruker_payload(
         })
         .collect::<Vec<_>>();
 
-    Ok(BrukerBridgePayload {
-        acquisition_mode,
+    BrukerBridgePayload {
+        acquisition_mode: acquisition_mode.to_string(),
         intensity_column: "timsrust_corrected_intensity_values".to_string(),
-        mz_min,
-        mz_max,
+        mz_min: accumulator.mz_min,
+        mz_max: accumulator.mz_max,
         frames_considered,
-        frames_with_signal,
-        matched_events,
-        rt_profile,
+        frames_with_signal: accumulator.frames_with_signal,
+        matched_events: accumulator.matched_events,
+        rt_profile: accumulator.rt_profile,
         mz_profile,
         im_profile,
-    })
+    }
 }
 
 fn build_timsrust_pseudo_ms2(
@@ -3408,9 +3714,7 @@ fn write_summary_svg(
     let data_context =
         compact_backend_label(summary.backend_label, summary.acquisition_mode.as_deref());
     let capability_context = compact_capability_label(summary.capabilities);
-    let acquisition_line = format!(
-        "{filter_line} | {data_context} | {capability_context}",
-    );
+    let acquisition_line = format!("{filter_line} | {data_context} | {capability_context}",);
     let counts_line = format!(
         "Spectra considered: {} | With signal: {} | Matched peaks: {}",
         summary.spectra_considered, summary.spectra_with_signal, summary.matched_peaks,
@@ -4568,6 +4872,73 @@ mod tests {
         .expect("options parse");
         assert_eq!(options.outdir.as_deref(), Some(Path::new("plots")));
         assert_eq!(options.verbosity, super::Verbosity::Verbose);
+    }
+
+    #[test]
+    fn parse_args_accepts_repeatable_mz_targets_for_bruker() {
+        let options = parse_args(vec![
+            "--bruker".into(),
+            "run.d".into(),
+            "--target".into(),
+            "hexnac_204:204.0867".into(),
+            "--target".into(),
+            "292.1027".into(),
+            "--mz-da".into(),
+            "0.02".into(),
+        ])
+        .expect("target options parse");
+        assert_eq!(options.mz_targets.len(), 2);
+        assert_eq!(options.mz_targets[0].label, "hexnac_204");
+        assert!((options.mz_targets[0].mz - 204.0867).abs() < 1e-9);
+        assert_eq!(options.mz_targets[1].label, "mz_292.1027");
+        assert_eq!(
+            options.request.as_ref().expect("request").mz,
+            options.mz_targets[0].mz
+        );
+    }
+
+    #[test]
+    fn parse_args_rejects_repeatable_targets_for_mzml() {
+        let err = parse_args(vec![
+            "--mzml".into(),
+            "demo.mzML".into(),
+            "--target".into(),
+            "hexnac_204:204.0867".into(),
+        ])
+        .expect_err("mzML target batch should fail");
+        assert!(err
+            .to_string()
+            .contains("repeatable --target currently supports native Bruker .d"));
+    }
+
+    #[test]
+    fn parse_args_rejects_duplicate_target_labels() {
+        let err = parse_args(vec![
+            "--bruker".into(),
+            "run.d".into(),
+            "--target".into(),
+            "hexnac:204.0867".into(),
+            "--target".into(),
+            "hexnac:204.0868".into(),
+        ])
+        .expect_err("duplicate target labels should fail");
+        assert!(err.to_string().contains("duplicate --target label"));
+    }
+
+    #[test]
+    fn multi_target_out_prefix_uses_out_prefix_as_base() {
+        let input = super::DiaInput::Bruker(PathBuf::from("run.d"));
+        let target = super::DiaMzTarget {
+            label: "hexnac_204".to_string(),
+            mz: 204.0867,
+        };
+        let path = super::multi_target_out_prefix(
+            &input,
+            Some(&PathBuf::from("plots")),
+            Some(&PathBuf::from("glyco")),
+            &target,
+        );
+        assert_eq!(path, PathBuf::from("plots/glyco__hexnac_204"));
     }
 
     #[test]

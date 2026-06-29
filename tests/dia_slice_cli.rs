@@ -62,6 +62,7 @@ fn dia_slice_help_mentions_runtime_and_slice_flags() {
     assert!(stdout.contains("--python <exe>"));
     assert!(stdout.contains("--peptide <SEQ>"));
     assert!(stdout.contains("--fragment <ion>"));
+    assert!(stdout.contains("--target <label:mz>"));
     assert!(stdout.contains("--neutral-losses"));
     assert!(stdout.contains("--charge <int>"));
     assert!(stdout.contains("--pseudo-ms2"));
