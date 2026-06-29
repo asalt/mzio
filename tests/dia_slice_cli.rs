@@ -124,7 +124,10 @@ fn dia_slice_mzml_writes_profiles_and_svg() {
     let svg = fs::read_to_string(output_path(&out_prefix, "svg")).expect("read svg");
     assert!(svg.contains("Source:"));
     assert!(!svg.contains(&demo_mzml_path().display().to_string()));
-    assert!(svg.contains("Target: m/z 500.0000 (z=1)"));
+    assert!(svg.contains("Target: m/z 500.0000 | window 0.0000-1000.0000"));
+    assert!(svg.contains("mzML | RT/m/z"));
+    assert!(!svg.contains("Backend:"));
+    assert!(!svg.contains("Capabilities:"));
     assert!(svg.contains("RT profile"));
     assert!(svg.contains("m/z profile"));
 

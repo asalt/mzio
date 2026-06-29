@@ -104,6 +104,33 @@ impl DiaCapabilities {
     }
 }
 
+fn compact_backend_label(label: &str, acquisition_mode: Option<&str>) -> String {
+    let backend = match label {
+        "Bruker .d (timsrust native)" => "Bruker native",
+        "Bruker .d (alphaTims bridge)" => "Bruker alphaTims",
+        other => other,
+    };
+    match acquisition_mode.filter(|mode| !mode.is_empty()) {
+        Some(mode) if backend.starts_with("Bruker") => format!("{backend} {mode}"),
+        _ => backend.to_string(),
+    }
+}
+
+fn compact_capability_label(capabilities: DiaCapabilities) -> String {
+    let mut dimensions = vec!["RT", "m/z"];
+    if capabilities.has_mobility {
+        dimensions.push("mobility");
+    }
+    let mut label = dimensions.join("/");
+    if capabilities.has_isolation_window {
+        label.push_str("; quad windows");
+    }
+    if capabilities.requires_vendor_runtime {
+        label.push_str("; vendor runtime");
+    }
+    label
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct DiaSliceRequest {
     pub(crate) mz: f64,
@@ -3371,17 +3398,18 @@ fn write_summary_svg(
             ),
         },
         None => format!(
-            "Target: m/z {:.4} (z=1) | window {:.4}-{:.4} | RT {}",
+            "Target: m/z {:.4} | window {:.4}-{:.4} | RT {}",
             request.mz,
             summary.mz_min,
             summary.mz_max,
             request.rt_window_label(),
         ),
     };
+    let data_context =
+        compact_backend_label(summary.backend_label, summary.acquisition_mode.as_deref());
+    let capability_context = compact_capability_label(summary.capabilities);
     let acquisition_line = format!(
-        "{filter_line} | Backend: {} | Capabilities: {}",
-        summary.backend_label,
-        summary.capabilities.labels(),
+        "{filter_line} | {data_context} | {capability_context}",
     );
     let counts_line = format!(
         "Spectra considered: {} | With signal: {} | Matched peaks: {}",
