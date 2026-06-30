@@ -75,6 +75,7 @@ fn dia_slice_help_mentions_runtime_and_slice_flags() {
     assert!(stdout.contains("--outdir <dir>"));
     assert!(stdout.contains("--rt-smooth"));
     assert!(stdout.contains("--rt-smooth-window <n>"));
+    assert!(stdout.contains("run_tic.json"));
     assert!(stdout.contains("-v, --verbose"));
     assert!(stdout.contains("-q, --quiet"));
     assert!(stdout.contains("MZIO_BRUKER_SO"));
@@ -129,6 +130,7 @@ fn dia_slice_mzml_writes_profiles_and_svg() {
     assert!(svg.contains("mzML | RT/m/z"));
     assert!(!svg.contains("Backend:"));
     assert!(!svg.contains("Capabilities:"));
+    assert!(svg.contains("TIC "));
     assert!(svg.contains("RT profile"));
     assert!(svg.contains("m/z profile"));
 

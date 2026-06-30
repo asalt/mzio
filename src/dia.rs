@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Context;
 use libloading::Library;
 use mzdata::io::SpectrumSource;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use timsrust::converters::ConvertableDomain;
 use timsrust::readers::{FrameReader, MetadataReader};
 use timsrust::{AcquisitionType, Frame, MSLevel, Metadata};
@@ -269,6 +269,167 @@ impl Verbosity {
 struct TimsrustFrameCandidate {
     reader_index: usize,
     rt_seconds: f64,
+}
+
+#[derive(Clone, Debug)]
+struct TimsrustExtraction {
+    payloads: Vec<BrukerBridgePayload>,
+    run_tic: BrukerRunTicSummary,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct BrukerRunTicSummary {
+    schema_version: u8,
+    source: PathBuf,
+    backend: &'static str,
+    acquisition_mode: String,
+    intensity_column: &'static str,
+    total_frames: usize,
+    rt_min_minutes: Option<f64>,
+    rt_max_minutes: Option<f64>,
+    ms1: BrukerRunTicLevelSummary,
+    ms2: BrukerRunTicLevelSummary,
+    unknown: BrukerRunTicLevelSummary,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+struct BrukerRunTicLevelSummary {
+    frames: usize,
+    frames_with_signal: usize,
+    detector_events: usize,
+    summed_tic: f64,
+    max_tic: f64,
+    max_tic_frame: Option<usize>,
+    max_tic_rt_minutes: Option<f64>,
+}
+
+#[derive(Debug)]
+struct BrukerRunTicAccumulator {
+    total_frames: usize,
+    rt_min_seconds: f64,
+    rt_max_seconds: f64,
+    ms1: BrukerRunTicLevelAccumulator,
+    ms2: BrukerRunTicLevelAccumulator,
+    unknown: BrukerRunTicLevelAccumulator,
+}
+
+#[derive(Debug, Default)]
+struct BrukerRunTicLevelAccumulator {
+    frames: usize,
+    frames_with_signal: usize,
+    detector_events: usize,
+    summed_tic: f64,
+    max_tic: f64,
+    max_tic_frame: Option<usize>,
+    max_tic_rt_minutes: Option<f64>,
+}
+
+impl BrukerRunTicAccumulator {
+    fn new() -> Self {
+        Self {
+            total_frames: 0,
+            rt_min_seconds: f64::INFINITY,
+            rt_max_seconds: f64::NEG_INFINITY,
+            ms1: BrukerRunTicLevelAccumulator::default(),
+            ms2: BrukerRunTicLevelAccumulator::default(),
+            unknown: BrukerRunTicLevelAccumulator::default(),
+        }
+    }
+
+    fn add_frame(&mut self, frame: &Frame) {
+        self.total_frames = self.total_frames.saturating_add(1);
+        if frame.rt_in_seconds.is_finite() {
+            self.rt_min_seconds = self.rt_min_seconds.min(frame.rt_in_seconds);
+            self.rt_max_seconds = self.rt_max_seconds.max(frame.rt_in_seconds);
+        }
+
+        let tic = corrected_frame_tic(frame);
+        let rt_minutes = frame
+            .rt_in_seconds
+            .is_finite()
+            .then_some(frame.rt_in_seconds / 60.0);
+        match frame.ms_level {
+            MSLevel::MS1 => {
+                self.ms1
+                    .add_frame(frame.index, rt_minutes, frame.intensities.len(), tic)
+            }
+            MSLevel::MS2 => {
+                self.ms2
+                    .add_frame(frame.index, rt_minutes, frame.intensities.len(), tic)
+            }
+            MSLevel::Unknown => {
+                self.unknown
+                    .add_frame(frame.index, rt_minutes, frame.intensities.len(), tic)
+            }
+        }
+    }
+
+    fn finalize(self, source: &Path, acquisition_mode: String) -> BrukerRunTicSummary {
+        BrukerRunTicSummary {
+            schema_version: 1,
+            source: source.to_path_buf(),
+            backend: "Bruker .d (timsrust native)",
+            acquisition_mode,
+            intensity_column: "timsrust_corrected_intensity_values",
+            total_frames: self.total_frames,
+            rt_min_minutes: finite_seconds_to_minutes(self.rt_min_seconds),
+            rt_max_minutes: finite_seconds_to_minutes(self.rt_max_seconds),
+            ms1: self.ms1.finalize(),
+            ms2: self.ms2.finalize(),
+            unknown: self.unknown.finalize(),
+        }
+    }
+}
+
+impl BrukerRunTicLevelAccumulator {
+    fn add_frame(
+        &mut self,
+        frame_index: usize,
+        rt_minutes: Option<f64>,
+        detector_events: usize,
+        tic: f64,
+    ) {
+        self.frames = self.frames.saturating_add(1);
+        self.detector_events = self.detector_events.saturating_add(detector_events);
+        if tic.is_finite() && tic > 0.0 {
+            self.frames_with_signal = self.frames_with_signal.saturating_add(1);
+            self.summed_tic += tic;
+            if tic > self.max_tic {
+                self.max_tic = tic;
+                self.max_tic_frame = Some(frame_index);
+                self.max_tic_rt_minutes = rt_minutes;
+            }
+        }
+    }
+
+    fn finalize(self) -> BrukerRunTicLevelSummary {
+        BrukerRunTicLevelSummary {
+            frames: self.frames,
+            frames_with_signal: self.frames_with_signal,
+            detector_events: self.detector_events,
+            summed_tic: self.summed_tic,
+            max_tic: self.max_tic,
+            max_tic_frame: self.max_tic_frame,
+            max_tic_rt_minutes: self.max_tic_rt_minutes,
+        }
+    }
+}
+
+fn corrected_frame_tic(frame: &Frame) -> f64 {
+    let factor = frame.intensity_correction_factor;
+    if !factor.is_finite() || factor <= 0.0 {
+        return 0.0;
+    }
+    frame
+        .intensities
+        .iter()
+        .map(|value| *value as f64 * factor)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .sum()
+}
+
+fn finite_seconds_to_minutes(value: f64) -> Option<f64> {
+    value.is_finite().then_some(value / 60.0)
 }
 
 #[derive(Debug)]
@@ -697,6 +858,7 @@ fn run_multi_target_slices(
         path,
         &requests,
         &out_prefixes,
+        &multi_target_run_tic_prefix(input, options.outdir.as_ref(), options.out_prefix.as_ref()),
         options.mz_profile_bins,
         options.rt_smooth,
         options.rt_smooth_window,
@@ -782,6 +944,7 @@ fn print_help() {
     println!("  <prefix>.rt_profile.tsv");
     println!("  <prefix>.mz_profile.tsv");
     println!("  <prefix>.im_profile.tsv  Mobility-capable backends only");
+    println!("  <prefix>.run_tic.json    Native Bruker run-level MS1/MS2 TIC summary");
     println!("  <prefix>.svg");
     println!();
     println!("NOTES:");
@@ -1319,6 +1482,25 @@ fn multi_target_out_prefix(
         .unwrap_or(file_prefix)
 }
 
+fn multi_target_run_tic_prefix(
+    input: &DiaInput,
+    outdir: Option<&PathBuf>,
+    out_prefix: Option<&PathBuf>,
+) -> PathBuf {
+    let file_prefix = out_prefix
+        .map(|base| {
+            base.file_name()
+                .and_then(|value| value.to_str())
+                .filter(|value| !value.is_empty())
+                .unwrap_or("dia_slice")
+                .to_string()
+        })
+        .unwrap_or_else(|| input.default_stem());
+    outdir
+        .map(|outdir| outdir.join(&file_prefix))
+        .unwrap_or_else(|| PathBuf::from(file_prefix))
+}
+
 fn request_target_label(request: &DiaSliceRequest) -> String {
     request
         .peptide_target
@@ -1557,7 +1739,8 @@ fn run_bruker_slice_timsrust(
         "DIA slice: reading Bruker .d with timsrust and extracting m/z {:.6}-{:.6}",
         mz_min, mz_max
     ));
-    let payload = build_timsrust_bruker_payload(path, request, mz_profile_bins, verbosity)?;
+    let (payload, run_tic) =
+        build_timsrust_bruker_payload(path, request, mz_profile_bins, verbosity)?;
     verbosity.detail(format_args!(
         "DIA slice: native extraction yielded {} frames with signal from {} considered frames",
         payload.frames_with_signal, payload.frames_considered
@@ -1581,6 +1764,7 @@ fn run_bruker_slice_timsrust(
         rt_smooth,
         rt_smooth_window,
     )?;
+    write_bruker_run_tic_json(out_prefix, &run_tic)?;
     if pseudo_ms2.enabled {
         verbosity.status(format_args!(
             "Pseudo-MS2: inferring RT window from the extracted precursor trace"
@@ -1610,6 +1794,7 @@ fn run_bruker_multi_target_timsrust(
     path: &Path,
     requests: &[DiaSliceRequest],
     out_prefixes: &[PathBuf],
+    run_tic_prefix: &Path,
     mz_profile_bins: usize,
     rt_smooth: bool,
     rt_smooth_window: usize,
@@ -1637,9 +1822,12 @@ fn run_bruker_multi_target_timsrust(
         requests.len(),
         ranges
     ));
-    let payloads = build_timsrust_bruker_payloads(path, requests, mz_profile_bins, verbosity)?;
-    let mut summaries = Vec::with_capacity(payloads.len());
-    for ((request, out_prefix), payload) in requests.iter().zip(out_prefixes).zip(payloads) {
+    let extraction = build_timsrust_bruker_payloads(path, requests, mz_profile_bins, verbosity)?;
+    write_bruker_run_tic_json(run_tic_prefix, &extraction.run_tic)?;
+    let mut summaries = Vec::with_capacity(extraction.payloads.len());
+    for ((request, out_prefix), payload) in
+        requests.iter().zip(out_prefixes).zip(extraction.payloads)
+    {
         let has_isolation_window = payload.acquisition_mode == "diaPASEF";
         let summary = finish_bruker_slice_outputs(
             path,
@@ -1842,16 +2030,18 @@ fn build_timsrust_bruker_payload(
     request: &DiaSliceRequest,
     mz_profile_bins: usize,
     verbosity: Verbosity,
-) -> anyhow::Result<BrukerBridgePayload> {
-    let mut payloads = build_timsrust_bruker_payloads(
+) -> anyhow::Result<(BrukerBridgePayload, BrukerRunTicSummary)> {
+    let mut extraction = build_timsrust_bruker_payloads(
         path,
         std::slice::from_ref(request),
         mz_profile_bins,
         verbosity,
     )?;
-    payloads
+    let payload = extraction
+        .payloads
         .pop()
-        .ok_or_else(|| anyhow::anyhow!("native timsrust extraction produced no payload"))
+        .ok_or_else(|| anyhow::anyhow!("native timsrust extraction produced no payload"))?;
+    Ok((payload, extraction.run_tic))
 }
 
 fn build_timsrust_bruker_payloads(
@@ -1859,7 +2049,7 @@ fn build_timsrust_bruker_payloads(
     requests: &[DiaSliceRequest],
     mz_profile_bins: usize,
     verbosity: Verbosity,
-) -> anyhow::Result<Vec<BrukerBridgePayload>> {
+) -> anyhow::Result<TimsrustExtraction> {
     let Some(base_request) = requests.first() else {
         anyhow::bail!("native timsrust extraction requires at least one m/z target");
     };
@@ -1881,26 +2071,31 @@ fn build_timsrust_bruker_payloads(
         .map(|request| prepare_timsrust_slice_accumulator(&metadata, request, mz_profile_bins))
         .collect::<anyhow::Result<Vec<_>>>()?;
     let total_frames = frame_reader.len();
-    let candidate_frames = collect_timsrust_ms2_frame_candidates(&frame_reader, |rt_seconds| {
-        rt_seconds_in_window(rt_seconds, base_request.rt_min, base_request.rt_max)
-    })?;
     verbosity.detail(format_args!(
-        "DIA slice: scanning {} MS2 frames after RT filtering from {} total frames for {} target(s)",
-        candidate_frames.len(),
+        "DIA slice: scanning {} total frames for run TIC and {} target(s)",
         total_frames,
         accumulators.len()
     ));
-    let mut progress = ProgressReporter::new(
-        "DIA slice native MS2 frames",
-        candidate_frames.len(),
-        verbosity,
-    );
+    let mut progress = ProgressReporter::new("DIA slice native frames", total_frames, verbosity);
 
-    let frames_considered = candidate_frames.len();
-    for candidate in candidate_frames.iter() {
-        let frame = frame_reader.get(candidate.reader_index).with_context(|| {
-            format!("failed to read Bruker frame {}", candidate.reader_index + 1)
-        })?;
+    let mut run_tic_accumulator = BrukerRunTicAccumulator::new();
+    let mut frames_considered = 0usize;
+    for frame_index in 0..total_frames {
+        let frame = frame_reader
+            .get(frame_index)
+            .with_context(|| format!("failed to read Bruker frame {}", frame_index + 1))?;
+        run_tic_accumulator.add_frame(&frame);
+        if frame.ms_level != MSLevel::MS2
+            || !rt_seconds_in_window(
+                frame.rt_in_seconds,
+                base_request.rt_min,
+                base_request.rt_max,
+            )
+        {
+            progress.advance();
+            continue;
+        }
+        frames_considered += 1;
         let mut frame_intensities = vec![0.0_f64; accumulators.len()];
         let mut frame_events = vec![0usize; accumulators.len()];
 
@@ -1973,12 +2168,16 @@ fn build_timsrust_bruker_payloads(
     progress.finish();
 
     let acquisition_mode = timsrust_acquisition_label(acquisition).to_string();
-    Ok(accumulators
+    let payloads = accumulators
         .into_iter()
         .map(|accumulator| {
             finalize_timsrust_slice_payload(accumulator, &acquisition_mode, frames_considered)
         })
-        .collect())
+        .collect();
+    Ok(TimsrustExtraction {
+        payloads,
+        run_tic: run_tic_accumulator.finalize(path, acquisition_mode),
+    })
 }
 
 fn prepare_timsrust_slice_accumulator(
@@ -2703,6 +2902,24 @@ fn write_outputs(
         rt_smooth,
         rt_smooth_window,
     )?;
+    Ok(())
+}
+
+fn write_bruker_run_tic_json(
+    out_prefix: &Path,
+    run_tic: &BrukerRunTicSummary,
+) -> anyhow::Result<()> {
+    let path = output_path(out_prefix, "run_tic.json");
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+    }
+    let file =
+        File::create(&path).with_context(|| format!("failed to create {}", path.display()))?;
+    serde_json::to_writer_pretty(file, run_tic)
+        .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
 }
 
@@ -3790,6 +4007,12 @@ fn write_summary_svg(
     let rt_points = rt_points(rt_rows);
     let rt_smoothed_points =
         rt_smooth.then(|| gaussian_smooth_points(&rt_points, rt_smooth_window));
+    let rt_tic = rt_rows.iter().map(|row| row.summed_intensity).sum::<f64>();
+    let rt_annotation = if rt_smoothed_points.is_some() {
+        format!("TIC {} | smoothed", format_compact_intensity(rt_tic))
+    } else {
+        format!("TIC {}", format_compact_intensity(rt_tic))
+    };
     let rt_canvas = SvgCanvas::new(
         margin_left,
         panel_top,
@@ -3831,6 +4054,7 @@ fn write_summary_svg(
             .with_tick_label_style(AxisTickLabelStyle::Scientific(2)),
         &rt_points,
         rt_smoothed_points.as_deref(),
+        Some(&rt_annotation),
         COLOR_RT,
     );
     if let Some(im_rows) = im_rows.filter(|rows| !rows.is_empty()) {
@@ -3856,6 +4080,7 @@ fn write_summary_svg(
                 .with_tick_label_style(AxisTickLabelStyle::Scientific(2)),
             &mobility_points(im_rows),
             None,
+            None,
             "#0f766e",
         );
     }
@@ -3870,6 +4095,7 @@ fn write_summary_svg(
         AxisProps::new(AxisOrientation::Left, "summed intensity")
             .with_tick_label_style(AxisTickLabelStyle::Scientific(2)),
         &mz_points(mz_bins),
+        None,
         None,
         COLOR_MZ,
     );
@@ -3889,6 +4115,7 @@ fn append_chart(
     y_axis: AxisProps,
     points: &[(f64, f64)],
     overlay_points: Option<&[(f64, f64)]>,
+    top_right_label: Option<&str>,
     color: &str,
 ) {
     let _ = writeln!(
@@ -3909,6 +4136,24 @@ fn append_chart(
         COLOR_TEXT,
         escape_xml(title)
     );
+    if let Some(label) = top_right_label {
+        let _ = writeln!(
+            svg,
+            "<text x=\"{:.2}\" y=\"{:.2}\" font-size=\"12\" text-anchor=\"end\" fill=\"{}\" font-family=\"Menlo, Consolas, Liberation Mono, monospace\">{}</text>",
+            canvas.right(),
+            canvas.top() - 16.0,
+            COLOR_SUBTLE,
+            escape_xml(label)
+        );
+    } else if overlay_points.is_some_and(|points| points.len() > 1) {
+        let _ = writeln!(
+            svg,
+            "<text x=\"{:.2}\" y=\"{:.2}\" font-size=\"12\" text-anchor=\"end\" fill=\"{}\" font-family=\"Menlo, Consolas, Liberation Mono, monospace\">smoothed overlay</text>",
+            canvas.right(),
+            canvas.top() - 16.0,
+            COLOR_SUBTLE
+        );
+    }
 
     let x_ticks = linear_ticks(x_domain.min(), x_domain.max(), 5);
     let y_ticks = linear_ticks(y_domain.min(), y_domain.max(), 5);
@@ -4017,13 +4262,6 @@ fn append_chart(
             overlay_path,
             color
         );
-        let _ = writeln!(
-            svg,
-            "<text x=\"{:.2}\" y=\"{:.2}\" font-size=\"12\" text-anchor=\"end\" fill=\"{}\" font-family=\"Menlo, Consolas, Liberation Mono, monospace\">smoothed overlay</text>",
-            canvas.right(),
-            canvas.top() - 16.0,
-            COLOR_SUBTLE
-        );
     }
 }
 
@@ -4035,6 +4273,14 @@ fn chart_path_data(canvas: SvgCanvas, points: &[(f64, f64)]) -> String {
         let _ = write!(path_data, "{command}{px:.2},{py:.2} ");
     }
     path_data.trim_end().to_string()
+}
+
+fn format_compact_intensity(value: f64) -> String {
+    if value.is_finite() {
+        format!("{value:.3e}")
+    } else {
+        "NA".to_string()
+    }
 }
 
 fn append_mono_text_lines(
@@ -4391,6 +4637,7 @@ mod tests {
     use crate::annotate::NeutralLossKind;
     use crate::scale::CoordinateRange;
     use crate::svg_canvas::{AxisOrientation, AxisProps, SvgCanvas};
+    use timsrust::{Frame, MSLevel};
 
     use super::{
         accumulate_mz_bin, compact_display_path_with, initialize_mz_bins, padded_range, parse_args,
@@ -4461,6 +4708,49 @@ mod tests {
         assert_eq!(super::progress_bar_body(5, 10, 10), "=====.....");
         assert_eq!(super::progress_bar_body(10, 10, 10), "==========");
         assert_eq!(super::progress_percent(3, 4), 75);
+    }
+
+    #[test]
+    fn bruker_run_tic_accumulator_splits_ms_levels() {
+        let mut acc = super::BrukerRunTicAccumulator::new();
+        let ms1 = Frame {
+            index: 7,
+            rt_in_seconds: 30.0,
+            ms_level: MSLevel::MS1,
+            intensity_correction_factor: 2.0,
+            intensities: vec![10, 20],
+            ..Frame::default()
+        };
+        let ms2 = Frame {
+            index: 8,
+            rt_in_seconds: 90.0,
+            ms_level: MSLevel::MS2,
+            intensity_correction_factor: 0.5,
+            intensities: vec![8, 12],
+            ..Frame::default()
+        };
+
+        acc.add_frame(&ms1);
+        acc.add_frame(&ms2);
+        let summary = acc.finalize(Path::new("run.d"), "diaPASEF".to_string());
+
+        assert_eq!(summary.schema_version, 1);
+        assert_eq!(summary.total_frames, 2);
+        assert_eq!(summary.acquisition_mode, "diaPASEF");
+        assert_eq!(summary.ms1.frames, 1);
+        assert_eq!(summary.ms1.detector_events, 2);
+        assert_eq!(summary.ms1.max_tic_frame, Some(7));
+        assert!((summary.ms1.summed_tic - 60.0).abs() < 1e-9);
+        assert_eq!(summary.ms2.frames, 1);
+        assert_eq!(summary.ms2.max_tic_frame, Some(8));
+        assert!((summary.ms2.summed_tic - 10.0).abs() < 1e-9);
+        assert_eq!(summary.unknown.frames, 0);
+        assert!((summary.rt_min_minutes.expect("rt min") - 0.5).abs() < 1e-9);
+        assert!((summary.rt_max_minutes.expect("rt max") - 1.5).abs() < 1e-9);
+
+        let json = serde_json::to_string(&summary).expect("serialize run TIC summary");
+        assert!(json.contains("\"ms1\""));
+        assert!(json.contains("\"ms2\""));
     }
 
     #[test]
@@ -4613,9 +4903,11 @@ mod tests {
             AxisProps::new(AxisOrientation::Left, "summed intensity"),
             &points,
             Some(&smoothed),
+            Some("TIC 1.000e1 | smoothed"),
             "#1d4ed8",
         );
-        assert!(svg.contains("smoothed overlay"));
+        assert!(svg.contains("TIC 1.000e1 | smoothed"));
+        assert!(!svg.contains("smoothed overlay"));
         assert!(svg.contains("stroke-opacity=\"0.42\""));
     }
 
