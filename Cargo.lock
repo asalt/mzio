@@ -636,6 +636,7 @@ dependencies = [
  "mzpeaks",
  "quick-xml",
  "ratatui",
+ "rusqlite",
  "serde",
  "serde_json",
  "timsrust",

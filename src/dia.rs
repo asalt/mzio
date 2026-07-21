@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Context;
 use libloading::Library;
 use mzdata::io::SpectrumSource;
+use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use timsrust::converters::ConvertableDomain;
 use timsrust::readers::{FrameReader, MetadataReader};
@@ -18,6 +19,10 @@ use timsrust::{AcquisitionType, Frame, MSLevel, Metadata};
 use crate::annotate::{
     fragment_charge_states, generate_fragments, prepare_annotation, FragmentIon, FragmentSeries,
     MassTolerance, NeutralLossKind,
+};
+use crate::ion_table::{
+    fragment_label_markup, series_color, SvgIonTable, SvgIonTableCell, SvgIonTableEntry,
+    SvgIonTableRow,
 };
 use crate::mzml::{load_spectrum_by_index, open_reader};
 use crate::scale::CoordinateRange;
@@ -33,8 +38,16 @@ const BRUKER_PYTHON_ENV_VAR: &str = "MZIO_PYTHON";
 const DEFAULT_PEPTIDE_CHARGE: i32 = 2;
 const DEFAULT_PSEUDO_MS2_RT_WINDOW_MIN: f64 = 0.5;
 const DEFAULT_RT_SMOOTH_WINDOW_POINTS: usize = 9;
+const DEFAULT_TRACE_PEAK_SMOOTH_WINDOW_POINTS: usize = 7;
+const DEFAULT_TRACE_PEAK_SIGNAL_TO_NOISE: f64 = 3.0;
+const DEFAULT_TRACE_PEAK_BOUNDARY_SIGNAL_TO_NOISE: f64 = 1.0;
+const DEFAULT_TRACE_PEAK_BOUNDARY_FRACTION: f64 = 0.20;
+const DEFAULT_TRACE_PEAK_MIN_POINTS: usize = 3;
+const DEFAULT_TRACE_PEAK_MIN_NONZERO_POINTS: usize = 2;
 const RT_SMOOTH_ZERO_WEIGHT: f64 = 0.25;
 const PSEUDO_MS2_NEUTRAL_LOSS_MIN_RELATIVE_INTENSITY: f64 = 0.03;
+const TIMSRUST_CORRECTED_INTENSITY: &str = "timsrust_corrected_intensity_values";
+const ANALYSIS_TDF_FRAME_TIC_INTENSITY: &str = "analysis.tdf SummedIntensities / AccumulationTime";
 const COMMON_NEUTRAL_LOSSES: [NeutralLossKind; 3] = [
     NeutralLossKind::Water,
     NeutralLossKind::Ammonia,
@@ -116,23 +129,9 @@ fn compact_backend_label(label: &str, acquisition_mode: Option<&str>) -> String 
     }
 }
 
-fn compact_capability_label(capabilities: DiaCapabilities) -> String {
-    let mut dimensions = vec!["RT", "m/z"];
-    if capabilities.has_mobility {
-        dimensions.push("mobility");
-    }
-    let mut label = dimensions.join("/");
-    if capabilities.has_isolation_window {
-        label.push_str("; quad windows");
-    }
-    if capabilities.requires_vendor_runtime {
-        label.push_str("; vendor runtime");
-    }
-    label
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct DiaSliceRequest {
+    pub(crate) target_label: Option<String>,
     pub(crate) mz: f64,
     pub(crate) mz_ppm: f64,
     pub(crate) mz_da: Option<f64>,
@@ -172,6 +171,7 @@ pub(crate) struct DiaPeptideTarget {
     pub(crate) input: String,
     pub(crate) sequence: String,
     pub(crate) modified_sequence: String,
+    pub(crate) residue_labels: Vec<String>,
     pub(crate) charge: i32,
     pub(crate) precursor_mz: f64,
     pub(crate) fragment: Option<DiaFragmentTarget>,
@@ -207,6 +207,14 @@ struct DiaSliceOptions {
     neutral_losses_enabled: bool,
     pseudo_ms2: bool,
     pseudo_ms2_rt_window_min: f64,
+    trace_peaks: bool,
+    emit_trace: bool,
+    trace_peak_smooth_window_points: usize,
+    trace_peak_signal_to_noise: f64,
+    trace_peak_boundary_signal_to_noise: f64,
+    trace_peak_boundary_fraction: f64,
+    trace_peak_min_points: usize,
+    trace_peak_min_nonzero_points: usize,
     rt_smooth: bool,
     rt_smooth_window: usize,
     verbosity: Verbosity,
@@ -231,6 +239,14 @@ impl Default for DiaSliceOptions {
             neutral_losses_enabled: false,
             pseudo_ms2: false,
             pseudo_ms2_rt_window_min: DEFAULT_PSEUDO_MS2_RT_WINDOW_MIN,
+            trace_peaks: false,
+            emit_trace: false,
+            trace_peak_smooth_window_points: DEFAULT_TRACE_PEAK_SMOOTH_WINDOW_POINTS,
+            trace_peak_signal_to_noise: DEFAULT_TRACE_PEAK_SIGNAL_TO_NOISE,
+            trace_peak_boundary_signal_to_noise: DEFAULT_TRACE_PEAK_BOUNDARY_SIGNAL_TO_NOISE,
+            trace_peak_boundary_fraction: DEFAULT_TRACE_PEAK_BOUNDARY_FRACTION,
+            trace_peak_min_points: DEFAULT_TRACE_PEAK_MIN_POINTS,
+            trace_peak_min_nonzero_points: DEFAULT_TRACE_PEAK_MIN_NONZERO_POINTS,
             rt_smooth: false,
             rt_smooth_window: DEFAULT_RT_SMOOTH_WINDOW_POINTS,
             verbosity: Verbosity::Normal,
@@ -336,41 +352,63 @@ impl BrukerRunTicAccumulator {
         }
     }
 
+    #[cfg(test)]
     fn add_frame(&mut self, frame: &Frame) {
+        self.add_frame_with_tic(frame, corrected_frame_tic(frame));
+    }
+
+    #[cfg(test)]
+    fn add_frame_with_tic(&mut self, frame: &Frame, tic: f64) {
+        self.add_values(
+            frame.index,
+            frame.rt_in_seconds,
+            frame.ms_level,
+            frame.intensities.len(),
+            tic,
+        );
+    }
+
+    fn add_values(
+        &mut self,
+        frame_index: usize,
+        rt_in_seconds: f64,
+        ms_level: MSLevel,
+        detector_events: usize,
+        tic: f64,
+    ) {
         self.total_frames = self.total_frames.saturating_add(1);
-        if frame.rt_in_seconds.is_finite() {
-            self.rt_min_seconds = self.rt_min_seconds.min(frame.rt_in_seconds);
-            self.rt_max_seconds = self.rt_max_seconds.max(frame.rt_in_seconds);
+        if rt_in_seconds.is_finite() {
+            self.rt_min_seconds = self.rt_min_seconds.min(rt_in_seconds);
+            self.rt_max_seconds = self.rt_max_seconds.max(rt_in_seconds);
         }
 
-        let tic = corrected_frame_tic(frame);
-        let rt_minutes = frame
-            .rt_in_seconds
-            .is_finite()
-            .then_some(frame.rt_in_seconds / 60.0);
-        match frame.ms_level {
-            MSLevel::MS1 => {
-                self.ms1
-                    .add_frame(frame.index, rt_minutes, frame.intensities.len(), tic)
-            }
-            MSLevel::MS2 => {
-                self.ms2
-                    .add_frame(frame.index, rt_minutes, frame.intensities.len(), tic)
-            }
+        let rt_minutes = rt_in_seconds.is_finite().then_some(rt_in_seconds / 60.0);
+        match ms_level {
+            MSLevel::MS1 => self
+                .ms1
+                .add_frame(frame_index, rt_minutes, detector_events, tic),
+            MSLevel::MS2 => self
+                .ms2
+                .add_frame(frame_index, rt_minutes, detector_events, tic),
             MSLevel::Unknown => {
                 self.unknown
-                    .add_frame(frame.index, rt_minutes, frame.intensities.len(), tic)
+                    .add_frame(frame_index, rt_minutes, detector_events, tic)
             }
         }
     }
 
-    fn finalize(self, source: &Path, acquisition_mode: String) -> BrukerRunTicSummary {
+    fn finalize(
+        self,
+        source: &Path,
+        acquisition_mode: String,
+        intensity_column: &'static str,
+    ) -> BrukerRunTicSummary {
         BrukerRunTicSummary {
             schema_version: 1,
             source: source.to_path_buf(),
             backend: "Bruker .d (timsrust native)",
             acquisition_mode,
-            intensity_column: "timsrust_corrected_intensity_values",
+            intensity_column,
             total_frames: self.total_frames,
             rt_min_minutes: finite_seconds_to_minutes(self.rt_min_seconds),
             rt_max_minutes: finite_seconds_to_minutes(self.rt_max_seconds),
@@ -550,6 +588,78 @@ struct PseudoMs2Options {
     rt_window_min: f64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct TracePeakOptions {
+    enabled: bool,
+    emit_trace: bool,
+    smooth_window_points: usize,
+    signal_to_noise: f64,
+    boundary_signal_to_noise: f64,
+    boundary_fraction: f64,
+    min_points: usize,
+    min_nonzero_points: usize,
+}
+
+impl Default for TracePeakOptions {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+impl TracePeakOptions {
+    fn disabled() -> Self {
+        Self {
+            enabled: false,
+            emit_trace: false,
+            smooth_window_points: DEFAULT_TRACE_PEAK_SMOOTH_WINDOW_POINTS,
+            signal_to_noise: DEFAULT_TRACE_PEAK_SIGNAL_TO_NOISE,
+            boundary_signal_to_noise: DEFAULT_TRACE_PEAK_BOUNDARY_SIGNAL_TO_NOISE,
+            boundary_fraction: DEFAULT_TRACE_PEAK_BOUNDARY_FRACTION,
+            min_points: DEFAULT_TRACE_PEAK_MIN_POINTS,
+            min_nonzero_points: DEFAULT_TRACE_PEAK_MIN_NONZERO_POINTS,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct TracePoint {
+    scan_index: u32,
+    scan_id: String,
+    rt_minutes: Option<f64>,
+    target_intensity: f64,
+    matched_events: usize,
+    ms2_frame_tic: Option<f64>,
+}
+
+#[derive(Clone, Debug)]
+struct TracePeak {
+    peak_index: usize,
+    scan_start: u32,
+    scan_end: u32,
+    scan_apex: u32,
+    rt_start_min: Option<f64>,
+    rt_end_min: Option<f64>,
+    rt_apex_min: Option<f64>,
+    apex_intensity: f64,
+    peak_sum_intensity: f64,
+    peak_area_raw: f64,
+    peak_area_baseline_corrected: f64,
+    signal_to_noise: f64,
+    baseline_level: f64,
+    baseline_noise_mad: f64,
+    baseline_points_used: usize,
+    threshold: f64,
+    boundary_threshold: f64,
+    n_points: usize,
+    n_nonzero_points: usize,
+    peak_width_min: Option<f64>,
+    fwhm_min: Option<f64>,
+    fwhm_to_width_ratio: Option<f64>,
+    center_of_mass_rt: Option<f64>,
+    peak_stdev_min: Option<f64>,
+    peak_skew: Option<f64>,
+}
+
 #[derive(Clone, Debug)]
 struct PseudoMs2Report {
     input_path: PathBuf,
@@ -591,34 +701,6 @@ struct PseudoMs2FragmentEvidence {
     frames_with_signal: usize,
     apex_rt: Option<f64>,
     apex_intensity: f64,
-}
-
-#[derive(Clone, Debug)]
-struct PseudoIonTableRow {
-    cleavage_index: usize,
-    y_ordinal: usize,
-    b1: Vec<PseudoIonTableCell>,
-    b2: Vec<PseudoIonTableCell>,
-    y1: Vec<PseudoIonTableCell>,
-    y2: Vec<PseudoIonTableCell>,
-}
-
-#[derive(Clone, Debug)]
-struct PseudoIonTableCell {
-    label: String,
-    series: String,
-    neutral_loss: Option<NeutralLossKind>,
-    mz: f64,
-    summed_intensity: f64,
-    matched_events: usize,
-    frames_with_signal: usize,
-    apex_rt: Option<f64>,
-}
-
-impl PseudoIonTableCell {
-    fn detected(&self) -> bool {
-        self.summed_intensity > 0.0
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -694,6 +776,8 @@ struct BrukerBridgePayload {
     frames_with_signal: usize,
     matched_events: usize,
     rt_profile: Vec<BrukerBridgeRtRow>,
+    #[serde(default)]
+    dense_rt_trace: Vec<TracePoint>,
     mz_profile: Vec<BrukerBridgeMzRow>,
     im_profile: Vec<BrukerBridgeImRow>,
 }
@@ -727,6 +811,7 @@ struct TimsrustSliceAccumulator {
     frames_with_signal: usize,
     matched_events: usize,
     rt_profile: Vec<BrukerBridgeRtRow>,
+    dense_rt_trace: Vec<TracePoint>,
     im_accumulator: BTreeMap<usize, (f64, f64)>,
 }
 
@@ -787,6 +872,7 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
             },
             options.rt_smooth,
             options.rt_smooth_window,
+            trace_peak_options(&options),
             options.verbosity,
             DiaCapabilities {
                 has_mobility: false,
@@ -807,6 +893,7 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
             },
             options.rt_smooth,
             options.rt_smooth_window,
+            trace_peak_options(&options),
             options.verbosity,
             &out_prefix,
         ),
@@ -862,9 +949,23 @@ fn run_multi_target_slices(
         options.mz_profile_bins,
         options.rt_smooth,
         options.rt_smooth_window,
+        trace_peak_options(options),
         options.verbosity,
     )
     .with_context(|| "native timsrust multi-target extraction failed")
+}
+
+fn trace_peak_options(options: &DiaSliceOptions) -> TracePeakOptions {
+    TracePeakOptions {
+        enabled: options.trace_peaks,
+        emit_trace: options.emit_trace,
+        smooth_window_points: options.trace_peak_smooth_window_points,
+        signal_to_noise: options.trace_peak_signal_to_noise,
+        boundary_signal_to_noise: options.trace_peak_boundary_signal_to_noise,
+        boundary_fraction: options.trace_peak_boundary_fraction,
+        min_points: options.trace_peak_min_points,
+        min_nonzero_points: options.trace_peak_min_nonzero_points,
+    }
 }
 
 fn print_help() {
@@ -900,6 +1001,32 @@ fn print_help() {
         "  --pseudo-ms2             Write aggregated DIA fragment evidence as pseudo-MS2 TSV/SVG"
     );
     println!("  --ms2                    Alias for --pseudo-ms2");
+    println!("  --trace-peaks            Call MASIC-like peaks from a dense selected-ion trace");
+    println!("  --emit-trace             Also write <prefix>.trace.tsv; implies --trace-peaks");
+    println!(
+        "  --trace-peak-smooth-window <n>  Peak caller smoothing window in trace points [{}]",
+        DEFAULT_TRACE_PEAK_SMOOTH_WINDOW_POINTS
+    );
+    println!(
+        "  --trace-peak-snr <x>     Peak detection threshold, baseline + x*MAD noise [{}]",
+        DEFAULT_TRACE_PEAK_SIGNAL_TO_NOISE
+    );
+    println!(
+        "  --trace-peak-boundary-snr <x>  Peak boundary floor, baseline + x*MAD noise [{}]",
+        DEFAULT_TRACE_PEAK_BOUNDARY_SIGNAL_TO_NOISE
+    );
+    println!(
+        "  --trace-peak-boundary-fraction <x>  Boundary floor as fraction of local smoothed peak height [{}]",
+        DEFAULT_TRACE_PEAK_BOUNDARY_FRACTION
+    );
+    println!(
+        "  --trace-peak-min-points <n>  Minimum points per called peak [{}]",
+        DEFAULT_TRACE_PEAK_MIN_POINTS
+    );
+    println!(
+        "  --trace-peak-min-nonzero <n>  Minimum nonzero points per called peak [{}]",
+        DEFAULT_TRACE_PEAK_MIN_NONZERO_POINTS
+    );
     println!(
         "  --pseudo-ms2-rt-window <min>  Inferred RT window width [{}]",
         DEFAULT_PSEUDO_MS2_RT_WINDOW_MIN
@@ -945,6 +1072,8 @@ fn print_help() {
     println!("  <prefix>.mz_profile.tsv");
     println!("  <prefix>.im_profile.tsv  Mobility-capable backends only");
     println!("  <prefix>.run_tic.json    Native Bruker run-level MS1/MS2 TIC summary");
+    println!("  <prefix>.peaks.tsv       With --trace-peaks");
+    println!("  <prefix>.trace.tsv       With --emit-trace");
     println!("  <prefix>.svg");
     println!();
     println!("NOTES:");
@@ -1019,6 +1148,55 @@ fn parse_args(args: Vec<String>) -> anyhow::Result<DiaSliceOptions> {
             }
             "--pseudo-ms2" | "--ms2" => {
                 options.pseudo_ms2 = true;
+            }
+            "--trace-peaks" => {
+                options.trace_peaks = true;
+            }
+            "--emit-trace" => {
+                options.trace_peaks = true;
+                options.emit_trace = true;
+            }
+            "--trace-peak-smooth-window" => {
+                let raw = iter
+                    .next()
+                    .context("--trace-peak-smooth-window expects an integer")?;
+                options.trace_peak_smooth_window_points = raw
+                    .parse::<usize>()
+                    .context("invalid --trace-peak-smooth-window")?;
+                options.trace_peaks = true;
+            }
+            "--trace-peak-snr" => {
+                options.trace_peak_signal_to_noise =
+                    parse_f64_flag("--trace-peak-snr", iter.next())?;
+                options.trace_peaks = true;
+            }
+            "--trace-peak-boundary-snr" => {
+                options.trace_peak_boundary_signal_to_noise =
+                    parse_f64_flag("--trace-peak-boundary-snr", iter.next())?;
+                options.trace_peaks = true;
+            }
+            "--trace-peak-boundary-fraction" => {
+                options.trace_peak_boundary_fraction =
+                    parse_f64_flag("--trace-peak-boundary-fraction", iter.next())?;
+                options.trace_peaks = true;
+            }
+            "--trace-peak-min-points" => {
+                let raw = iter
+                    .next()
+                    .context("--trace-peak-min-points expects an integer")?;
+                options.trace_peak_min_points = raw
+                    .parse::<usize>()
+                    .context("invalid --trace-peak-min-points")?;
+                options.trace_peaks = true;
+            }
+            "--trace-peak-min-nonzero" => {
+                let raw = iter
+                    .next()
+                    .context("--trace-peak-min-nonzero expects an integer")?;
+                options.trace_peak_min_nonzero_points = raw
+                    .parse::<usize>()
+                    .context("invalid --trace-peak-min-nonzero")?;
+                options.trace_peaks = true;
             }
             "--pseudo-ms2-rt-window" => {
                 options.pseudo_ms2_rt_window_min =
@@ -1112,6 +1290,29 @@ fn parse_args(args: Vec<String>) -> anyhow::Result<DiaSliceOptions> {
     }
     if options.pseudo_ms2_rt_window_min <= 0.0 || !options.pseudo_ms2_rt_window_min.is_finite() {
         anyhow::bail!("--pseudo-ms2-rt-window must be a positive finite number");
+    }
+    if options.trace_peak_smooth_window_points == 0 {
+        anyhow::bail!("--trace-peak-smooth-window must be at least 1");
+    }
+    if options.trace_peak_signal_to_noise <= 0.0 || !options.trace_peak_signal_to_noise.is_finite()
+    {
+        anyhow::bail!("--trace-peak-snr must be a positive finite number");
+    }
+    if options.trace_peak_boundary_signal_to_noise < 0.0
+        || !options.trace_peak_boundary_signal_to_noise.is_finite()
+    {
+        anyhow::bail!("--trace-peak-boundary-snr must be a finite non-negative number");
+    }
+    if !(0.0..=1.0).contains(&options.trace_peak_boundary_fraction)
+        || !options.trace_peak_boundary_fraction.is_finite()
+    {
+        anyhow::bail!("--trace-peak-boundary-fraction must be finite and between 0 and 1");
+    }
+    if options.trace_peak_min_points == 0 {
+        anyhow::bail!("--trace-peak-min-points must be at least 1");
+    }
+    if options.trace_peak_min_nonzero_points == 0 {
+        anyhow::bail!("--trace-peak-min-nonzero must be at least 1");
     }
     let input = options.input.as_ref().ok_or_else(|| {
         anyhow::anyhow!("dia-slice requires exactly one of --mzml <file> or --bruker <run.d>")
@@ -1218,8 +1419,12 @@ fn parse_args(args: Vec<String>) -> anyhow::Result<DiaSliceOptions> {
     if options.pseudo_ms2 && options.bruker_backend == BrukerBackend::AlphaTims {
         anyhow::bail!("--pseudo-ms2 currently requires --bruker-backend native or auto");
     }
+    if options.trace_peaks && options.bruker_backend == BrukerBackend::AlphaTims {
+        anyhow::bail!("--trace-peaks currently requires --bruker-backend native or mzML input");
+    }
 
     options.request = Some(DiaSliceRequest {
+        target_label: None,
         mz,
         mz_ppm,
         mz_da,
@@ -1284,6 +1489,7 @@ fn resolve_peptide_target(
         input: peptide_input.to_string(),
         sequence: context.peptide.sequence().to_string(),
         modified_sequence: context.modified_sequence(),
+        residue_labels: context.modified_residue_labels(),
         charge,
         precursor_mz,
         fragment,
@@ -1451,6 +1657,7 @@ fn default_out_prefix(input: &DiaInput, request: &DiaSliceRequest) -> PathBuf {
 
 fn request_for_mz_target(base_request: &DiaSliceRequest, target: &DiaMzTarget) -> DiaSliceRequest {
     let mut request = base_request.clone();
+    request.target_label = Some(target.label.clone());
     request.mz = target.mz;
     request.peptide_target = None;
     request
@@ -1502,6 +1709,9 @@ fn multi_target_run_tic_prefix(
 }
 
 fn request_target_label(request: &DiaSliceRequest) -> String {
+    if let Some(label) = &request.target_label {
+        return format!("{} m/z {:.4}", label, request.mz);
+    }
     request
         .peptide_target
         .as_ref()
@@ -1526,6 +1736,7 @@ fn run_mzml_slice(
     pseudo_ms2: &PseudoMs2Options,
     rt_smooth: bool,
     rt_smooth_window: usize,
+    trace_options: TracePeakOptions,
     verbosity: Verbosity,
     capabilities: DiaCapabilities,
 ) -> anyhow::Result<()> {
@@ -1628,6 +1839,8 @@ fn run_mzml_slice(
         None,
         rt_smooth,
         rt_smooth_window,
+        None,
+        trace_options,
     )?;
 
     verbosity.success(format_args!(
@@ -1650,6 +1863,7 @@ fn run_bruker_slice(
     pseudo_ms2: &PseudoMs2Options,
     rt_smooth: bool,
     rt_smooth_window: usize,
+    trace_options: TracePeakOptions,
     verbosity: Verbosity,
     out_prefix: &Path,
 ) -> anyhow::Result<()> {
@@ -1668,6 +1882,7 @@ fn run_bruker_slice(
             pseudo_ms2,
             rt_smooth,
             rt_smooth_window,
+            trace_options,
             verbosity,
             out_prefix,
         ),
@@ -1690,6 +1905,7 @@ fn run_bruker_slice(
                 pseudo_ms2,
                 rt_smooth,
                 rt_smooth_window,
+                trace_options,
                 verbosity,
                 out_prefix,
             ) {
@@ -1698,6 +1914,10 @@ fn run_bruker_slice(
                     if pseudo_ms2.enabled {
                         return Err(native_err)
                             .context("--pseudo-ms2 requires the native timsrust Bruker backend");
+                    }
+                    if trace_options.enabled {
+                        return Err(native_err)
+                            .context("--trace-peaks requires the native timsrust Bruker backend");
                     }
                     verbosity.status(format_args!(
                         "Native timsrust Bruker backend failed; falling back to alphaTims bridge ({native_err:#})"
@@ -1731,6 +1951,7 @@ fn run_bruker_slice_timsrust(
     pseudo_ms2: &PseudoMs2Options,
     rt_smooth: bool,
     rt_smooth_window: usize,
+    trace_options: TracePeakOptions,
     verbosity: Verbosity,
     out_prefix: &Path,
 ) -> anyhow::Result<()> {
@@ -1739,8 +1960,13 @@ fn run_bruker_slice_timsrust(
         "DIA slice: reading Bruker .d with timsrust and extracting m/z {:.6}-{:.6}",
         mz_min, mz_max
     ));
-    let (payload, run_tic) =
-        build_timsrust_bruker_payload(path, request, mz_profile_bins, verbosity)?;
+    let (payload, run_tic) = build_timsrust_bruker_payload(
+        path,
+        request,
+        mz_profile_bins,
+        trace_options.enabled,
+        verbosity,
+    )?;
     verbosity.detail(format_args!(
         "DIA slice: native extraction yielded {} frames with signal from {} considered frames",
         payload.frames_with_signal, payload.frames_considered
@@ -1763,6 +1989,7 @@ fn run_bruker_slice_timsrust(
         false,
         rt_smooth,
         rt_smooth_window,
+        trace_options,
     )?;
     write_bruker_run_tic_json(out_prefix, &run_tic)?;
     if pseudo_ms2.enabled {
@@ -1798,6 +2025,7 @@ fn run_bruker_multi_target_timsrust(
     mz_profile_bins: usize,
     rt_smooth: bool,
     rt_smooth_window: usize,
+    trace_options: TracePeakOptions,
     verbosity: Verbosity,
 ) -> anyhow::Result<()> {
     if !path.is_dir() {
@@ -1822,7 +2050,13 @@ fn run_bruker_multi_target_timsrust(
         requests.len(),
         ranges
     ));
-    let extraction = build_timsrust_bruker_payloads(path, requests, mz_profile_bins, verbosity)?;
+    let extraction = build_timsrust_bruker_payloads(
+        path,
+        requests,
+        mz_profile_bins,
+        trace_options.enabled,
+        verbosity,
+    )?;
     write_bruker_run_tic_json(run_tic_prefix, &extraction.run_tic)?;
     let mut summaries = Vec::with_capacity(extraction.payloads.len());
     for ((request, out_prefix), payload) in
@@ -1841,6 +2075,7 @@ fn run_bruker_multi_target_timsrust(
             true,
             rt_smooth,
             rt_smooth_window,
+            trace_options,
         )?;
         summaries.push(summary);
     }
@@ -1899,6 +2134,7 @@ fn run_bruker_slice_alphatims(
         false,
         rt_smooth,
         rt_smooth_window,
+        TracePeakOptions::default(),
     )?;
     print_bruker_success(out_prefix, &summary, verbosity);
     Ok(())
@@ -1916,6 +2152,7 @@ fn finish_bruker_slice_outputs(
     allow_empty: bool,
     rt_smooth: bool,
     rt_smooth_window: usize,
+    trace_options: TracePeakOptions,
 ) -> anyhow::Result<DiaSliceSummary> {
     if payload.matched_events == 0 && !allow_empty {
         anyhow::bail!(
@@ -1958,6 +2195,7 @@ fn finish_bruker_slice_outputs(
             summed_intensity: row.summed_intensity,
         })
         .collect::<Vec<_>>();
+    let dense_rt_trace = payload.dense_rt_trace;
 
     let summary = DiaSliceSummary {
         backend_label,
@@ -1985,6 +2223,8 @@ fn finish_bruker_slice_outputs(
         Some(&im_rows),
         rt_smooth,
         rt_smooth_window,
+        Some(&dense_rt_trace),
+        trace_options,
     )?;
     Ok(summary)
 }
@@ -2029,12 +2269,14 @@ fn build_timsrust_bruker_payload(
     path: &Path,
     request: &DiaSliceRequest,
     mz_profile_bins: usize,
+    collect_dense_trace: bool,
     verbosity: Verbosity,
 ) -> anyhow::Result<(BrukerBridgePayload, BrukerRunTicSummary)> {
     let mut extraction = build_timsrust_bruker_payloads(
         path,
         std::slice::from_ref(request),
         mz_profile_bins,
+        collect_dense_trace,
         verbosity,
     )?;
     let payload = extraction
@@ -2048,6 +2290,7 @@ fn build_timsrust_bruker_payloads(
     path: &Path,
     requests: &[DiaSliceRequest],
     mz_profile_bins: usize,
+    collect_dense_trace: bool,
     verbosity: Verbosity,
 ) -> anyhow::Result<TimsrustExtraction> {
     let Some(base_request) = requests.first() else {
@@ -2071,30 +2314,29 @@ fn build_timsrust_bruker_payloads(
         .map(|request| prepare_timsrust_slice_accumulator(&metadata, request, mz_profile_bins))
         .collect::<anyhow::Result<Vec<_>>>()?;
     let total_frames = frame_reader.len();
+    let acquisition_mode = timsrust_acquisition_label(acquisition).to_string();
+    let run_tic = read_bruker_run_tic_summary(path, acquisition_mode.clone())?;
+    let candidate_frames = collect_timsrust_ms2_frame_candidates(&frame_reader, |rt_seconds| {
+        rt_seconds_in_window(rt_seconds, base_request.rt_min, base_request.rt_max)
+    })?;
     verbosity.detail(format_args!(
-        "DIA slice: scanning {} total frames for run TIC and {} target(s)",
+        "DIA slice: scanning {} RT-selected MS2 frames from {} total frames for {} target(s); run TIC read from analysis.tdf",
+        candidate_frames.len(),
         total_frames,
         accumulators.len()
     ));
-    let mut progress = ProgressReporter::new("DIA slice native frames", total_frames, verbosity);
+    let mut progress = ProgressReporter::new(
+        "DIA slice native RT-selected MS2 frames",
+        candidate_frames.len(),
+        verbosity,
+    );
 
-    let mut run_tic_accumulator = BrukerRunTicAccumulator::new();
     let mut frames_considered = 0usize;
-    for frame_index in 0..total_frames {
-        let frame = frame_reader
-            .get(frame_index)
-            .with_context(|| format!("failed to read Bruker frame {}", frame_index + 1))?;
-        run_tic_accumulator.add_frame(&frame);
-        if frame.ms_level != MSLevel::MS2
-            || !rt_seconds_in_window(
-                frame.rt_in_seconds,
-                base_request.rt_min,
-                base_request.rt_max,
-            )
-        {
-            progress.advance();
-            continue;
-        }
+    for candidate in candidate_frames {
+        let frame = frame_reader.get(candidate.reader_index).with_context(|| {
+            format!("failed to read Bruker frame {}", candidate.reader_index + 1)
+        })?;
+        let frame_tic = corrected_frame_tic(&frame);
         frames_considered += 1;
         let mut frame_intensities = vec![0.0_f64; accumulators.len()];
         let mut frame_events = vec![0usize; accumulators.len()];
@@ -2153,6 +2395,16 @@ fn build_timsrust_bruker_payloads(
         }
 
         for (target_idx, accumulator) in accumulators.iter_mut().enumerate() {
+            if collect_dense_trace {
+                accumulator.dense_rt_trace.push(TracePoint {
+                    scan_index: frame.index as u32,
+                    scan_id: format!("frame={}", frame.index),
+                    rt_minutes: Some(frame.rt_in_seconds / 60.0),
+                    target_intensity: frame_intensities[target_idx],
+                    matched_events: frame_events[target_idx],
+                    ms2_frame_tic: Some(frame_tic),
+                });
+            }
             if frame_events[target_idx] > 0 {
                 accumulator.frames_with_signal += 1;
                 accumulator.rt_profile.push(BrukerBridgeRtRow {
@@ -2167,17 +2419,64 @@ fn build_timsrust_bruker_payloads(
     }
     progress.finish();
 
-    let acquisition_mode = timsrust_acquisition_label(acquisition).to_string();
     let payloads = accumulators
         .into_iter()
         .map(|accumulator| {
             finalize_timsrust_slice_payload(accumulator, &acquisition_mode, frames_considered)
         })
         .collect();
-    Ok(TimsrustExtraction {
-        payloads,
-        run_tic: run_tic_accumulator.finalize(path, acquisition_mode),
-    })
+    Ok(TimsrustExtraction { payloads, run_tic })
+}
+
+fn read_bruker_run_tic_summary(
+    path: &Path,
+    acquisition_mode: String,
+) -> anyhow::Result<BrukerRunTicSummary> {
+    let tdf_path = path.join("analysis.tdf");
+    let connection = Connection::open_with_flags(
+        &tdf_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("failed to open {} for run TIC metadata", tdf_path.display()))?;
+    let mut statement = connection
+        .prepare(
+            "SELECT Id, Time, MsMsType, NumPeaks, SummedIntensities, AccumulationTime \
+             FROM Frames ORDER BY Id",
+        )
+        .with_context(|| format!("failed to query Frames metadata in {}", tdf_path.display()))?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, f64>(1)?,
+            row.get::<_, u8>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, f64>(5)?,
+        ))
+    })?;
+
+    let mut accumulator = BrukerRunTicAccumulator::new();
+    for row in rows {
+        let (frame_id, rt_seconds, msms_type, peak_count, summed_intensities, accumulation_time) =
+            row.with_context(|| {
+                format!("failed to read Frames metadata in {}", tdf_path.display())
+            })?;
+        let frame_index = usize::try_from(frame_id.max(0)).unwrap_or(usize::MAX);
+        let detector_events = usize::try_from(peak_count.max(0)).unwrap_or(usize::MAX);
+        let tic = if accumulation_time.is_finite() && accumulation_time > 0.0 {
+            summed_intensities.max(0) as f64 / accumulation_time
+        } else {
+            0.0
+        };
+        accumulator.add_values(
+            frame_index,
+            rt_seconds,
+            MSLevel::read_from_msms_type(msms_type),
+            detector_events,
+            tic,
+        );
+    }
+    Ok(accumulator.finalize(path, acquisition_mode, ANALYSIS_TDF_FRAME_TIC_INTENSITY))
 }
 
 fn prepare_timsrust_slice_accumulator(
@@ -2208,6 +2507,7 @@ fn prepare_timsrust_slice_accumulator(
         frames_with_signal: 0,
         matched_events: 0,
         rt_profile: Vec::new(),
+        dense_rt_trace: Vec::new(),
         im_accumulator: BTreeMap::new(),
     })
 }
@@ -2236,13 +2536,14 @@ fn finalize_timsrust_slice_payload(
 
     BrukerBridgePayload {
         acquisition_mode: acquisition_mode.to_string(),
-        intensity_column: "timsrust_corrected_intensity_values".to_string(),
+        intensity_column: TIMSRUST_CORRECTED_INTENSITY.to_string(),
         mz_min: accumulator.mz_min,
         mz_max: accumulator.mz_max,
         frames_considered,
         frames_with_signal: accumulator.frames_with_signal,
         matched_events: accumulator.matched_events,
         rt_profile: accumulator.rt_profile,
+        dense_rt_trace: accumulator.dense_rt_trace,
         mz_profile,
         im_profile,
     }
@@ -2881,6 +3182,8 @@ fn write_outputs(
     im_rows: Option<&[MobilityProfileRow]>,
     rt_smooth: bool,
     rt_smooth_window: usize,
+    trace_points: Option<&[TracePoint]>,
+    trace_options: TracePeakOptions,
 ) -> anyhow::Result<()> {
     if let Some(parent) = summary.out_prefix.parent() {
         if !parent.as_os_str().is_empty() {
@@ -2902,7 +3205,573 @@ fn write_outputs(
         rt_smooth,
         rt_smooth_window,
     )?;
+    if trace_options.enabled {
+        let fallback_trace;
+        let trace_points = match trace_points {
+            Some(points) => points,
+            None => {
+                fallback_trace = trace_points_from_rt_rows(rt_rows);
+                &fallback_trace
+            }
+        };
+        write_trace_peak_outputs(summary, request, trace_points, trace_options)?;
+    }
     Ok(())
+}
+
+fn trace_points_from_rt_rows(rt_rows: &[RtProfileRow]) -> Vec<TracePoint> {
+    rt_rows
+        .iter()
+        .map(|row| TracePoint {
+            scan_index: row.scan_index,
+            scan_id: row.scan_id.clone(),
+            rt_minutes: row.rt_minutes,
+            target_intensity: row.summed_intensity,
+            matched_events: row.matched_peaks,
+            ms2_frame_tic: None,
+        })
+        .collect()
+}
+
+fn write_trace_peak_outputs(
+    summary: &DiaSliceSummary,
+    request: &DiaSliceRequest,
+    trace_points: &[TracePoint],
+    options: TracePeakOptions,
+) -> anyhow::Result<()> {
+    write_trace_peaks_tsv(summary, request, trace_points, options)?;
+    if options.emit_trace {
+        write_trace_tsv(summary, request, trace_points)?;
+    }
+    Ok(())
+}
+
+fn write_trace_peaks_tsv(
+    summary: &DiaSliceSummary,
+    request: &DiaSliceRequest,
+    trace_points: &[TracePoint],
+    options: TracePeakOptions,
+) -> anyhow::Result<()> {
+    let path = output_path(&summary.out_prefix, "peaks.tsv");
+    let mut file =
+        File::create(&path).with_context(|| format!("failed to create {}", path.display()))?;
+    let target_label = request_target_label(request);
+    writeln!(file, "# source\t{}", summary.input_path.display())?;
+    writeln!(file, "# target\t{}", sanitize_tsv(&target_label))?;
+    writeln!(
+        file,
+        "# mz_window\t{:.6}\t{:.6}",
+        summary.mz_min, summary.mz_max
+    )?;
+    writeln!(
+        file,
+        "# method\tselected-ion trace; smooth_window_points={}; detection_threshold=baseline+{}*MAD_noise; boundary_threshold=max(baseline+{}*MAD_noise, baseline+{}*local_smoothed_peak_height)",
+        options.smooth_window_points,
+        options.signal_to_noise,
+        options.boundary_signal_to_noise,
+        options.boundary_fraction,
+    )?;
+    writeln!(
+        file,
+        "# filters\tmin_points={}; min_nonzero_points={}",
+        options.min_points, options.min_nonzero_points
+    )?;
+    writeln!(
+        file,
+        "target_label\ttarget_mz\tmz_min\tmz_max\tpeak_index\tscan_start\tscan_end\tscan_apex\trt_start_min\trt_end_min\trt_apex_min\tapex_intensity\tpeak_sum_intensity\tpeak_area_raw\tpeak_area_baseline_corrected\tsignal_to_noise\tbaseline_level\tbaseline_noise_mad\tbaseline_points_used\tthreshold\tboundary_threshold\tn_points\tn_nonzero_points\tpeak_width_min\tfwhm_min\tfwhm_to_width_ratio\tcenter_of_mass_rt\tpeak_stdev_min\tpeak_skew"
+    )?;
+    for peak in call_trace_peaks(trace_points, options) {
+        writeln!(
+            file,
+            "{}\t{:.6}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{:.6}\t{}\t{:.6}\t{:.6}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            sanitize_tsv(&target_label),
+            request.mz,
+            summary.mz_min,
+            summary.mz_max,
+            peak.peak_index,
+            peak.scan_start,
+            peak.scan_end,
+            peak.scan_apex,
+            format_optional_f64(peak.rt_start_min, 6),
+            format_optional_f64(peak.rt_end_min, 6),
+            format_optional_f64(peak.rt_apex_min, 6),
+            peak.apex_intensity,
+            peak.peak_sum_intensity,
+            peak.peak_area_raw,
+            peak.peak_area_baseline_corrected,
+            peak.signal_to_noise,
+            peak.baseline_level,
+            peak.baseline_noise_mad,
+            peak.baseline_points_used,
+            peak.threshold,
+            peak.boundary_threshold,
+            peak.n_points,
+            peak.n_nonzero_points,
+            format_optional_f64(peak.peak_width_min, 6),
+            format_optional_f64(peak.fwhm_min, 6),
+            format_optional_f64(peak.fwhm_to_width_ratio, 6),
+            format_optional_f64(peak.center_of_mass_rt, 6),
+            format_optional_f64(peak.peak_stdev_min, 6),
+            format_optional_f64(peak.peak_skew, 6),
+        )?;
+    }
+    Ok(())
+}
+
+fn write_trace_tsv(
+    summary: &DiaSliceSummary,
+    request: &DiaSliceRequest,
+    trace_points: &[TracePoint],
+) -> anyhow::Result<()> {
+    let path = output_path(&summary.out_prefix, "trace.tsv");
+    let mut file =
+        File::create(&path).with_context(|| format!("failed to create {}", path.display()))?;
+    writeln!(file, "# source\t{}", summary.input_path.display())?;
+    writeln!(
+        file,
+        "# target\t{}",
+        sanitize_tsv(&request_target_label(request))
+    )?;
+    writeln!(
+        file,
+        "# mz_window\t{:.6}\t{:.6}",
+        summary.mz_min, summary.mz_max
+    )?;
+    writeln!(
+        file,
+        "scan_index\tscan_id\trt_minutes\ttarget_intensity\tmatched_events\tms2_frame_tic"
+    )?;
+    for point in trace_points {
+        writeln!(
+            file,
+            "{}\t{}\t{}\t{:.6}\t{}\t{}",
+            point.scan_index,
+            sanitize_tsv(&point.scan_id),
+            format_optional_f64(point.rt_minutes, 6),
+            trace_intensity(point),
+            point.matched_events,
+            format_optional_f64(point.ms2_frame_tic, 6),
+        )?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TracePeakInterval {
+    start: usize,
+    end: usize,
+    apex: usize,
+    boundary_threshold: f64,
+}
+
+fn call_trace_peaks(trace_points: &[TracePoint], options: TracePeakOptions) -> Vec<TracePeak> {
+    let mut points = trace_points
+        .iter()
+        .filter(|point| trace_point_x(point).is_finite())
+        .collect::<Vec<_>>();
+    points.sort_by(|a, b| {
+        trace_point_x(a)
+            .total_cmp(&trace_point_x(b))
+            .then_with(|| a.scan_index.cmp(&b.scan_index))
+    });
+    if points.len() < options.min_points {
+        return Vec::new();
+    }
+
+    let raw_points = points
+        .iter()
+        .map(|point| (trace_point_x(point), trace_intensity(point)))
+        .collect::<Vec<_>>();
+    let values = raw_points
+        .iter()
+        .map(|(_, value)| *value)
+        .collect::<Vec<_>>();
+    let max_intensity = values.iter().copied().fold(0.0_f64, f64::max);
+    if max_intensity <= 0.0 || !max_intensity.is_finite() {
+        return Vec::new();
+    }
+
+    let baseline = quantile(values.iter().copied(), 0.10)
+        .unwrap_or(0.0)
+        .max(0.0);
+    let median = quantile(values.iter().copied(), 0.50).unwrap_or(baseline);
+    let deviations = values
+        .iter()
+        .map(|value| (*value - median).abs())
+        .collect::<Vec<_>>();
+    let mut noise = quantile(deviations.iter().copied(), 0.50).unwrap_or(0.0) * 1.4826;
+    let signal_range = (max_intensity - baseline).max(0.0);
+    if signal_range <= f64::EPSILON {
+        return Vec::new();
+    }
+    if !noise.is_finite() || noise <= f64::EPSILON {
+        noise = (signal_range * 0.05).max(1e-9);
+    }
+    let mut threshold = baseline + options.signal_to_noise * noise;
+    if threshold >= max_intensity {
+        threshold = baseline + signal_range * 0.25;
+    }
+    let smoothed = gaussian_smooth_points(&raw_points, options.smooth_window_points);
+    let smoothed_max = smoothed.iter().map(|(_, value)| *value).fold(0.0, f64::max);
+    if smoothed_max > baseline && threshold >= smoothed_max {
+        threshold = baseline + (smoothed_max - baseline) * 0.25;
+    }
+    let boundary_noise_threshold = baseline + options.boundary_signal_to_noise * noise;
+    let baseline_points_used = values
+        .iter()
+        .filter(|value| **value <= boundary_noise_threshold)
+        .count();
+    let intervals = trace_peak_intervals(
+        &smoothed,
+        threshold,
+        baseline,
+        boundary_noise_threshold,
+        options.boundary_fraction,
+    );
+    let has_rt = points.iter().all(|point| point.rt_minutes.is_some());
+
+    intervals
+        .into_iter()
+        .filter_map(|interval| {
+            let start = interval.start;
+            let end = interval.end;
+            let n_points = end.saturating_sub(start) + 1;
+            let n_nonzero_points = raw_points[start..=end]
+                .iter()
+                .filter(|(_, value)| *value > 0.0)
+                .count();
+            if n_points < options.min_points || n_nonzero_points < options.min_nonzero_points {
+                return None;
+            }
+            let apex_idx = raw_trace_apex_index(&raw_points, start, end)
+                .unwrap_or_else(|| interval.apex.clamp(start, end));
+            let peak_sum_intensity = raw_points[start..=end]
+                .iter()
+                .map(|(_, value)| *value)
+                .sum::<f64>();
+            let peak_area_raw = if has_rt {
+                trace_trapezoid_area(&raw_points, start, end, 0.0)
+            } else {
+                peak_sum_intensity
+            };
+            let peak_area_baseline_corrected = if has_rt {
+                trace_trapezoid_area(&raw_points, start, end, baseline)
+            } else {
+                raw_points[start..=end]
+                    .iter()
+                    .map(|(_, value)| (*value - baseline).max(0.0))
+                    .sum()
+            };
+            let signal_to_noise = ((raw_points[apex_idx].1 - baseline).max(0.0)) / noise;
+            let (center_of_mass_rt, peak_stdev_min, peak_skew) = if has_rt {
+                trace_weighted_moments(&points, start, end, baseline)
+            } else {
+                (None, None, None)
+            };
+            let peak_width_min = trace_peak_width(&points, start, end);
+            let fwhm_min = has_rt
+                .then(|| trace_fwhm(&raw_points, &smoothed, start, end, baseline))
+                .flatten();
+            let fwhm_to_width_ratio = match (fwhm_min, peak_width_min) {
+                (Some(fwhm), Some(width)) if width > f64::EPSILON => Some(fwhm / width),
+                _ => None,
+            };
+            Some(TracePeak {
+                peak_index: 0,
+                scan_start: points[start].scan_index,
+                scan_end: points[end].scan_index,
+                scan_apex: points[apex_idx].scan_index,
+                rt_start_min: points[start].rt_minutes,
+                rt_end_min: points[end].rt_minutes,
+                rt_apex_min: points[apex_idx].rt_minutes,
+                apex_intensity: raw_points[apex_idx].1,
+                peak_sum_intensity,
+                peak_area_raw,
+                peak_area_baseline_corrected,
+                signal_to_noise,
+                baseline_level: baseline,
+                baseline_noise_mad: noise,
+                baseline_points_used,
+                threshold,
+                boundary_threshold: interval.boundary_threshold,
+                n_points,
+                n_nonzero_points,
+                peak_width_min,
+                fwhm_min,
+                fwhm_to_width_ratio,
+                center_of_mass_rt,
+                peak_stdev_min,
+                peak_skew,
+            })
+        })
+        .enumerate()
+        .map(|(idx, mut peak)| {
+            peak.peak_index = idx + 1;
+            peak
+        })
+        .collect()
+}
+
+fn trace_peak_intervals(
+    smoothed: &[(f64, f64)],
+    threshold: f64,
+    baseline: f64,
+    boundary_noise_threshold: f64,
+    boundary_fraction: f64,
+) -> Vec<TracePeakInterval> {
+    let mut apices = Vec::<usize>::new();
+    let mut idx = 0usize;
+    while idx < smoothed.len() {
+        while idx < smoothed.len() && smoothed[idx].1 < threshold {
+            idx += 1;
+        }
+        if idx >= smoothed.len() {
+            break;
+        }
+        let threshold_start = idx;
+        while idx < smoothed.len() && smoothed[idx].1 >= threshold {
+            idx += 1;
+        }
+        let threshold_end = idx.saturating_sub(1);
+        apices.extend(local_trace_apices(smoothed, threshold_start, threshold_end));
+    }
+    apices.sort_unstable();
+    apices.dedup();
+
+    let mut intervals = Vec::<TracePeakInterval>::new();
+    for (apex_pos, apex) in apices.iter().copied().enumerate() {
+        let local_peak_height = (smoothed[apex].1 - baseline).max(0.0);
+        let mut boundary_threshold =
+            boundary_noise_threshold.max(baseline + local_peak_height * boundary_fraction);
+        if boundary_threshold >= threshold {
+            boundary_threshold = baseline + (threshold - baseline).max(0.0) * 0.50;
+        }
+
+        let left_limit = if apex_pos == 0 {
+            0
+        } else {
+            valley_index(smoothed, apices[apex_pos - 1], apex).saturating_add(1)
+        };
+        let right_limit = if apex_pos + 1 < apices.len() {
+            valley_index(smoothed, apex, apices[apex_pos + 1])
+        } else {
+            smoothed.len().saturating_sub(1)
+        };
+        let mut start = apex;
+        while start > left_limit && smoothed[start - 1].1 > boundary_threshold {
+            start -= 1;
+        }
+        let mut end = apex;
+        while end < right_limit && smoothed[end + 1].1 > boundary_threshold {
+            end += 1;
+        }
+        if start > end {
+            continue;
+        }
+        intervals.push(TracePeakInterval {
+            start,
+            end,
+            apex,
+            boundary_threshold,
+        });
+    }
+    intervals
+}
+
+fn local_trace_apices(points: &[(f64, f64)], start: usize, end: usize) -> Vec<usize> {
+    let mut apices = Vec::new();
+    for idx in start..=end {
+        let left = idx
+            .checked_sub(1)
+            .map(|left| points[left].1)
+            .unwrap_or(f64::NEG_INFINITY);
+        let right = points
+            .get(idx + 1)
+            .map(|(_, value)| *value)
+            .unwrap_or(f64::NEG_INFINITY);
+        let value = points[idx].1;
+        if value >= left && value >= right && (value > left || value > right) {
+            apices.push(idx);
+        }
+    }
+    if apices.is_empty() {
+        apices.push(
+            (start..=end)
+                .max_by(|left, right| points[*left].1.total_cmp(&points[*right].1))
+                .unwrap_or(start),
+        );
+    }
+    apices
+}
+
+fn raw_trace_apex_index(points: &[(f64, f64)], start: usize, end: usize) -> Option<usize> {
+    (start..=end).max_by(|left, right| points[*left].1.total_cmp(&points[*right].1))
+}
+
+fn valley_index(points: &[(f64, f64)], left_apex: usize, right_apex: usize) -> usize {
+    let start = left_apex.min(right_apex);
+    let end = left_apex.max(right_apex);
+    (start..=end)
+        .min_by(|left, right| points[*left].1.total_cmp(&points[*right].1))
+        .unwrap_or(start)
+}
+
+fn trace_peak_width(points: &[&TracePoint], start: usize, end: usize) -> Option<f64> {
+    let start_rt = points.get(start)?.rt_minutes?;
+    let end_rt = points.get(end)?.rt_minutes?;
+    (end_rt >= start_rt).then_some(end_rt - start_rt)
+}
+
+fn trace_trapezoid_area(points: &[(f64, f64)], start: usize, end: usize, baseline: f64) -> f64 {
+    if end <= start {
+        return (points[start].1 - baseline).max(0.0);
+    }
+    (start..end)
+        .map(|idx| {
+            let dx = (points[idx + 1].0 - points[idx].0).max(0.0);
+            let y0 = (points[idx].1 - baseline).max(0.0);
+            let y1 = (points[idx + 1].1 - baseline).max(0.0);
+            0.5 * (y0 + y1) * dx
+        })
+        .sum()
+}
+
+fn trace_fwhm(
+    raw_points: &[(f64, f64)],
+    smoothed: &[(f64, f64)],
+    start: usize,
+    end: usize,
+    baseline: f64,
+) -> Option<f64> {
+    if end <= start {
+        return None;
+    }
+    let apex_idx = (start..=end)
+        .max_by(|left, right| smoothed[*left].1.total_cmp(&smoothed[*right].1))
+        .unwrap_or(start);
+    let apex = smoothed[apex_idx].1;
+    if apex <= baseline {
+        return None;
+    }
+    let half_height = baseline + (apex - baseline) / 2.0;
+    let mut left_x = raw_points[start].0;
+    for idx in (start + 1..=apex_idx).rev() {
+        if smoothed[idx - 1].1 < half_height && smoothed[idx].1 >= half_height {
+            left_x = interpolate_x_at_y(
+                raw_points[idx - 1],
+                raw_points[idx],
+                smoothed[idx - 1].1,
+                smoothed[idx].1,
+                half_height,
+            );
+            break;
+        }
+    }
+    let mut right_x = raw_points[end].0;
+    for idx in apex_idx..end {
+        if smoothed[idx].1 >= half_height && smoothed[idx + 1].1 < half_height {
+            right_x = interpolate_x_at_y(
+                raw_points[idx],
+                raw_points[idx + 1],
+                smoothed[idx].1,
+                smoothed[idx + 1].1,
+                half_height,
+            );
+            break;
+        }
+    }
+    (right_x > left_x).then_some(right_x - left_x)
+}
+
+fn interpolate_x_at_y(
+    left: (f64, f64),
+    right: (f64, f64),
+    left_y: f64,
+    right_y: f64,
+    target_y: f64,
+) -> f64 {
+    let denom = right_y - left_y;
+    if denom.abs() <= f64::EPSILON {
+        return left.0;
+    }
+    left.0 + ((target_y - left_y) / denom).clamp(0.0, 1.0) * (right.0 - left.0)
+}
+
+fn trace_weighted_moments(
+    points: &[&TracePoint],
+    start: usize,
+    end: usize,
+    baseline: f64,
+) -> (Option<f64>, Option<f64>, Option<f64>) {
+    let mut weight_sum = 0.0;
+    let mut weighted_rt_sum = 0.0;
+    for point in &points[start..=end] {
+        let Some(rt) = point.rt_minutes else {
+            return (None, None, None);
+        };
+        let weight = (trace_intensity(point) - baseline).max(0.0);
+        weight_sum += weight;
+        weighted_rt_sum += rt * weight;
+    }
+    if weight_sum <= f64::EPSILON {
+        return (None, None, None);
+    }
+    let center = weighted_rt_sum / weight_sum;
+    let variance = points[start..=end]
+        .iter()
+        .map(|point| {
+            let rt = point.rt_minutes.unwrap_or(center);
+            let weight = (trace_intensity(point) - baseline).max(0.0);
+            weight * (rt - center).powi(2)
+        })
+        .sum::<f64>()
+        / weight_sum;
+    let stdev = variance.max(0.0).sqrt();
+    let skew = if stdev > f64::EPSILON {
+        Some(
+            points[start..=end]
+                .iter()
+                .map(|point| {
+                    let rt = point.rt_minutes.unwrap_or(center);
+                    let weight = (trace_intensity(point) - baseline).max(0.0);
+                    weight * ((rt - center) / stdev).powi(3)
+                })
+                .sum::<f64>()
+                / weight_sum,
+        )
+    } else {
+        None
+    };
+    (Some(center), Some(stdev), skew)
+}
+
+fn trace_point_x(point: &TracePoint) -> f64 {
+    point.rt_minutes.unwrap_or(point.scan_index as f64)
+}
+
+fn trace_intensity(point: &TracePoint) -> f64 {
+    if point.target_intensity.is_finite() && point.target_intensity > 0.0 {
+        point.target_intensity
+    } else {
+        0.0
+    }
+}
+
+fn quantile(values: impl Iterator<Item = f64>, q: f64) -> Option<f64> {
+    let mut values = values.filter(|value| value.is_finite()).collect::<Vec<_>>();
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(f64::total_cmp);
+    let q = q.clamp(0.0, 1.0);
+    let pos = q * (values.len().saturating_sub(1)) as f64;
+    let lo = pos.floor() as usize;
+    let hi = pos.ceil() as usize;
+    if lo == hi {
+        return Some(values[lo]);
+    }
+    let frac = pos - lo as f64;
+    Some(values[lo] + (values[hi] - values[lo]) * frac)
 }
 
 fn write_bruker_run_tic_json(
@@ -2994,18 +3863,19 @@ fn write_pseudo_ms2_tsv(report: &PseudoMs2Report) -> anyhow::Result<()> {
 fn write_pseudo_ms2_svg(report: &PseudoMs2Report) -> anyhow::Result<()> {
     let path = output_path(&report.out_prefix, "pseudo_ms2.svg");
     let mut svg = String::new();
-    let table_rows = build_pseudo_ion_table_rows(report);
     let neutral_loss_cutoff = pseudo_ms2_neutral_loss_display_cutoff(&report.fragments);
-    let table_width = pseudo_ion_table_width(&table_rows);
-    let table_height = pseudo_ion_table_height(table_rows.len());
+    let table = build_pseudo_ion_table(report, neutral_loss_cutoff);
+    let table_layout = table.layout(SVG_WIDTH as f64 - 2.0 * SVG_MARGIN_X);
     let plot_left = 96.0;
     let plot_top = 210.0;
-    let plot_width = 1094.0;
+    let width = (table_layout.width + 2.0 * SVG_MARGIN_X)
+        .max(SVG_WIDTH as f64)
+        .ceil() as u32;
+    let plot_width = width as f64 - plot_left - 130.0;
     let plot_height = 410.0;
     let table_left = SVG_MARGIN_X;
     let table_top = plot_top + plot_height + 104.0;
-    let width = SVG_WIDTH;
-    let height = (table_top + table_height + 72.0).max(820.0).ceil() as u32;
+    let height = (table_top + table_layout.height + 72.0).max(820.0).ceil() as u32;
     let _ = writeln!(
         svg,
         "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w}\" height=\"{h}\" viewBox=\"0 0 {w} {h}\">",
@@ -3098,24 +3968,21 @@ fn write_pseudo_ms2_svg(report: &PseudoMs2Report) -> anyhow::Result<()> {
         y_domain,
     );
     draw_pseudo_ms2_axes(&mut svg, canvas, x_domain, y_domain);
-    draw_pseudo_ms2_sticks(&mut svg, canvas, &report.fragments, neutral_loss_cutoff);
-    draw_pseudo_ms2_legend(&mut svg, canvas.right() - 210.0, canvas.top() - 26.0);
-    draw_pseudo_ms2_ion_table(
+    draw_pseudo_ms2_sticks(
         &mut svg,
-        table_left,
-        table_top,
-        table_width,
-        table_height,
-        &table_rows,
-        &report.peptide.sequence,
+        canvas,
+        &report.fragments,
         neutral_loss_cutoff,
+        report.peptide.sequence.chars().count(),
     );
+    draw_pseudo_ms2_legend(&mut svg, canvas.right() - 210.0, canvas.top() - 26.0);
+    table.render(&mut svg, table_left, table_top, &table_layout);
     svg.push_str("</svg>\n");
     fs::write(&path, svg).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
 }
 
-fn build_pseudo_ion_table_rows(report: &PseudoMs2Report) -> Vec<PseudoIonTableRow> {
+fn build_pseudo_ion_table(report: &PseudoMs2Report, neutral_loss_cutoff: f64) -> SvgIonTable {
     let mut by_key = BTreeMap::<(&str, usize, u8), Vec<&PseudoMs2FragmentEvidence>>::new();
     for fragment in &report.fragments {
         by_key
@@ -3127,35 +3994,96 @@ fn build_pseudo_ion_table_rows(report: &PseudoMs2Report) -> Vec<PseudoIonTableRo
             .or_default()
             .push(fragment);
     }
-
     let residue_count = report.peptide.sequence.chars().count();
-    let mut rows = Vec::with_capacity(residue_count.saturating_sub(1));
-    for cleavage_index in 1..residue_count {
-        rows.push(PseudoIonTableRow {
-            cleavage_index,
-            y_ordinal: residue_count - cleavage_index,
-            b1: build_pseudo_ion_table_cell_entries(&by_key, "b", cleavage_index, 1),
-            b2: build_pseudo_ion_table_cell_entries(&by_key, "b", cleavage_index, 2),
-            y1: build_pseudo_ion_table_cell_entries(&by_key, "y", cleavage_index, 1),
-            y2: build_pseudo_ion_table_cell_entries(&by_key, "y", cleavage_index, 2),
+    let charges = report
+        .fragments
+        .iter()
+        .map(|fragment| fragment.charge)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut rows = Vec::with_capacity(residue_count);
+    for position in 1..=residue_count {
+        let mut b = BTreeMap::new();
+        let mut y = BTreeMap::new();
+        for charge in &charges {
+            if position < residue_count {
+                b.insert(
+                    *charge,
+                    build_pseudo_ion_table_cell(
+                        &by_key,
+                        FragmentSeries::B,
+                        position,
+                        position,
+                        *charge,
+                        neutral_loss_cutoff,
+                    ),
+                );
+            }
+            if position > 1 {
+                let cleavage_index = position - 1;
+                y.insert(
+                    *charge,
+                    build_pseudo_ion_table_cell(
+                        &by_key,
+                        FragmentSeries::Y,
+                        cleavage_index,
+                        residue_count - cleavage_index,
+                        *charge,
+                        neutral_loss_cutoff,
+                    ),
+                );
+            }
+        }
+        rows.push(SvgIonTableRow {
+            n_position: position,
+            c_position: residue_count - position + 1,
+            residue_label: report
+                .peptide
+                .residue_labels
+                .get(position - 1)
+                .cloned()
+                .unwrap_or_default(),
+            b,
+            y,
         });
     }
-    rows
+
+    SvgIonTable {
+        title: "Pseudo-MS2 ion table".to_string(),
+        evidence_legend: "colored = DIA evidence; grey = unmatched theoretical base ion"
+            .to_string(),
+        loss_legend: "loss lines = detected evidence: \u{2212}H\u{2082}O water, \u{2212}NH\u{2083} ammonia, \u{2212}H\u{2083}PO\u{2084} phosphoric acid"
+            .to_string(),
+        sequence: report.peptide.modified_sequence.clone(),
+        footer_note: Some(format!(
+            "neutral losses with at least {:.0}% of max fragment signal",
+            PSEUDO_MS2_NEUTRAL_LOSS_MIN_RELATIVE_INTENSITY * 100.0
+        )),
+        charges,
+        rows,
+    }
 }
 
-fn build_pseudo_ion_table_cell_entries(
+fn build_pseudo_ion_table_cell(
     by_key: &BTreeMap<(&str, usize, u8), Vec<&PseudoMs2FragmentEvidence>>,
-    series: &'static str,
+    series: FragmentSeries,
     cleavage_index: usize,
+    ordinal: usize,
     charge: u8,
-) -> Vec<PseudoIonTableCell> {
+    neutral_loss_cutoff: f64,
+) -> SvgIonTableCell {
+    let series_label = match series {
+        FragmentSeries::B => "b",
+        FragmentSeries::Y => "y",
+    };
     let mut fragments = by_key
-        .get(&(series, cleavage_index, charge))
+        .get(&(series_label, cleavage_index, charge))
         .cloned()
         .unwrap_or_default();
     fragments.sort_by(|left, right| {
-        neutral_loss_rank(left.neutral_loss)
-            .cmp(&neutral_loss_rank(right.neutral_loss))
+        left.neutral_loss
+            .cmp(&right.neutral_loss)
             .then_with(|| {
                 right
                     .summed_intensity
@@ -3168,23 +4096,36 @@ fn build_pseudo_ion_table_cell_entries(
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
     });
-    fragments
+    let entries = fragments
         .into_iter()
-        .map(pseudo_ion_table_cell)
-        .collect::<Vec<_>>()
-}
-
-fn pseudo_ion_table_cell(fragment: &PseudoMs2FragmentEvidence) -> PseudoIonTableCell {
-    PseudoIonTableCell {
-        label: fragment.label.clone(),
-        series: fragment.series.clone(),
-        neutral_loss: fragment.neutral_loss,
-        mz: fragment.mz,
-        summed_intensity: fragment.summed_intensity,
-        matched_events: fragment.matched_events,
-        frames_with_signal: fragment.frames_with_signal,
-        apex_rt: fragment.apex_rt,
-    }
+        .filter(|fragment| {
+            fragment.neutral_loss.is_none()
+                || (fragment.summed_intensity > 0.0
+                    && pseudo_ms2_neutral_loss_signal_is_visible(
+                        fragment.summed_intensity,
+                        fragment.neutral_loss,
+                        neutral_loss_cutoff,
+                    ))
+        })
+        .map(|fragment| SvgIonTableEntry {
+            series,
+            ordinal,
+            charge,
+            neutral_loss: fragment.neutral_loss,
+            mz: fragment.mz,
+            detected: fragment.summed_intensity > 0.0,
+            title: format!(
+                "{} theoretical {:.4} | summed {:.3e} | events {} | frames {} | apex RT {}",
+                fragment.label,
+                fragment.mz,
+                fragment.summed_intensity,
+                fragment.matched_events,
+                fragment.frames_with_signal,
+                format_optional_f64(fragment.apex_rt, 3)
+            ),
+        })
+        .collect::<Vec<_>>();
+    SvgIonTableCell { entries }
 }
 
 fn pseudo_ms2_neutral_loss_display_cutoff(fragments: &[PseudoMs2FragmentEvidence]) -> f64 {
@@ -3215,396 +4156,6 @@ fn pseudo_ms2_neutral_loss_signal_is_visible(
         || (summed_intensity.is_finite()
             && summed_intensity > 0.0
             && summed_intensity >= neutral_loss_cutoff)
-}
-
-fn pseudo_ion_table_has_charge2(rows: &[PseudoIonTableRow]) -> bool {
-    rows.iter()
-        .any(|row| !row.b2.is_empty() || !row.y2.is_empty())
-}
-
-fn pseudo_ion_table_width(_rows: &[PseudoIonTableRow]) -> f64 {
-    SVG_WIDTH as f64 - 2.0 * SVG_MARGIN_X
-}
-
-fn pseudo_ion_table_height(row_count: usize) -> f64 {
-    112.0 + row_count as f64 * pseudo_ion_table_row_height(row_count) + 68.0
-}
-
-fn pseudo_ion_table_row_height(row_count: usize) -> f64 {
-    if row_count <= 18 {
-        31.0
-    } else if row_count <= 32 {
-        28.0
-    } else {
-        24.0
-    }
-}
-
-fn pseudo_ion_table_font_size(row_count: usize) -> f64 {
-    if row_count <= 18 {
-        16.0
-    } else if row_count <= 32 {
-        14.0
-    } else {
-        12.0
-    }
-}
-
-fn draw_pseudo_ms2_ion_table(
-    svg: &mut String,
-    left: f64,
-    top: f64,
-    width: f64,
-    height: f64,
-    rows: &[PseudoIonTableRow],
-    sequence: &str,
-    neutral_loss_cutoff: f64,
-) {
-    let row_height = pseudo_ion_table_row_height(rows.len());
-    let font_size = pseudo_ion_table_font_size(rows.len());
-    let show_charge2 = pseudo_ion_table_has_charge2(rows);
-    let pad = 18.0;
-    let title_y = top + 24.0;
-    let meta_y = top + 47.0;
-    let meta2_y = top + 66.0;
-    let header_y = top + 96.0;
-    let row_start_y = top + 125.0;
-    let table_bottom = top + height;
-
-    let _ = writeln!(
-        svg,
-        "<rect x=\"{left:.2}\" y=\"{top:.2}\" width=\"{width:.2}\" height=\"{height:.2}\" rx=\"12\" fill=\"#fbfdff\" stroke=\"{}\" stroke-width=\"1\"/>",
-        COLOR_CARD_BORDER
-    );
-    let _ = writeln!(
-        svg,
-        "<text x=\"{:.2}\" y=\"{:.2}\" font-size=\"18\" fill=\"{}\" font-family=\"Menlo, Consolas, Liberation Mono, monospace\">Pseudo-MS2 ion table</text>",
-        left + pad,
-        title_y,
-        COLOR_TEXT
-    );
-    let _ = writeln!(
-        svg,
-        "<text x=\"{:.2}\" y=\"{:.2}\" font-size=\"13\" fill=\"{}\" font-family=\"Menlo, Consolas, Liberation Mono, monospace\">color = DIA evidence; grey = theoretical base ion</text>",
-        left + pad,
-        meta_y,
-        COLOR_SUBTLE
-    );
-    let _ = writeln!(
-        svg,
-        "<text x=\"{:.2}\" y=\"{:.2}\" font-size=\"13\" fill=\"{}\" font-family=\"Menlo, Consolas, Liberation Mono, monospace\">suffixes: +p = -H3PO4 phosphoric acid loss; +w = -H2O water loss; +n = -NH3 ammonia loss</text>",
-        left + pad,
-        meta2_y,
-        COLOR_SUBTLE
-    );
-
-    draw_pseudo_ion_table_block(
-        svg,
-        left + pad,
-        width - pad * 2.0,
-        header_y,
-        row_start_y,
-        row_height,
-        font_size,
-        show_charge2,
-        rows,
-        neutral_loss_cutoff,
-    );
-
-    let _ = writeln!(
-        svg,
-        "<text x=\"{:.2}\" y=\"{:.2}\" font-size=\"13\" fill=\"{}\" font-family=\"Menlo, Consolas, Liberation Mono, monospace\">sequence: {}</text>",
-        left + pad,
-        table_bottom - 40.0,
-        COLOR_SUBTLE,
-        escape_xml(sequence)
-    );
-    let _ = writeln!(
-        svg,
-        "<text x=\"{:.2}\" y=\"{:.2}\" font-size=\"13\" fill=\"{}\" font-family=\"Menlo, Consolas, Liberation Mono, monospace\">neutral losses with at least {:.0}% of max fragment signal</text>",
-        left + pad,
-        table_bottom - 16.0,
-        COLOR_SUBTLE,
-        PSEUDO_MS2_NEUTRAL_LOSS_MIN_RELATIVE_INTENSITY * 100.0
-    );
-}
-
-fn draw_pseudo_ion_table_block(
-    svg: &mut String,
-    left: f64,
-    width: f64,
-    header_y: f64,
-    row_start_y: f64,
-    row_height: f64,
-    font_size: f64,
-    show_charge2: bool,
-    rows: &[PseudoIonTableRow],
-    neutral_loss_cutoff: f64,
-) {
-    let cut_width = 58.0;
-    let column_gap = 14.0;
-    let value_columns = if show_charge2 { 4.0 } else { 2.0 };
-    let value_width = (width - cut_width - column_gap * value_columns) / value_columns;
-
-    let mut cursor = left;
-    let b2_right = if show_charge2 {
-        let right = cursor + value_width;
-        cursor = right + column_gap;
-        Some(right)
-    } else {
-        None
-    };
-    let b1_right = cursor + value_width;
-    cursor = b1_right + column_gap;
-    let cut_left = cursor;
-    let cut_center = cut_left + cut_width / 2.0;
-    cursor = cut_left + cut_width + column_gap;
-    let y1_left = cursor;
-    cursor = y1_left + value_width + column_gap;
-    let y2_left = show_charge2.then_some(cursor);
-
-    let mut headers = Vec::new();
-    if let Some(x) = b2_right {
-        headers.push(("b++", x, "end"));
-    }
-    headers.push(("b+", b1_right, "end"));
-    headers.push(("cut", cut_center, "middle"));
-    headers.push(("y+", y1_left, "start"));
-    if let Some(x) = y2_left {
-        headers.push(("y++", x, "start"));
-    }
-    for (label, x, anchor) in headers {
-        let _ = writeln!(
-            svg,
-            "<text x=\"{x:.2}\" y=\"{header_y:.2}\" font-size=\"12\" fill=\"{}\" text-anchor=\"{anchor}\" font-family=\"Menlo, Consolas, Liberation Mono, monospace\">{label}</text>",
-            COLOR_AXIS
-        );
-    }
-    let _ = writeln!(
-        svg,
-        "<line x1=\"{:.2}\" y1=\"{:.2}\" x2=\"{:.2}\" y2=\"{:.2}\" stroke=\"{}\" stroke-width=\"1\"/>",
-        left,
-        header_y + 8.0,
-        left + width,
-        header_y + 8.0,
-        COLOR_GRID
-    );
-
-    for (idx, row) in rows.iter().enumerate() {
-        let y = row_start_y + idx as f64 * row_height;
-        if idx > 0 {
-            let _ = writeln!(
-                svg,
-                "<line x1=\"{:.2}\" y1=\"{:.2}\" x2=\"{:.2}\" y2=\"{:.2}\" stroke=\"#eef2f6\" stroke-width=\"1\"/>",
-                left,
-                y - row_height / 2.0 + 3.0,
-                left + width,
-                y - row_height / 2.0 + 3.0
-            );
-        }
-        if let Some(x) = b2_right {
-            write_pseudo_ion_cell(
-                svg,
-                x,
-                y,
-                "end",
-                font_size,
-                value_width,
-                &row.b2,
-                neutral_loss_cutoff,
-            );
-        }
-        write_pseudo_ion_cell(
-            svg,
-            b1_right,
-            y,
-            "end",
-            font_size,
-            value_width,
-            &row.b1,
-            neutral_loss_cutoff,
-        );
-        let _ = writeln!(
-            svg,
-            "<text x=\"{cut_center:.2}\" y=\"{y:.2}\" font-size=\"{font_size:.1}\" fill=\"{}\" text-anchor=\"middle\" font-family=\"Menlo, Consolas, Liberation Mono, monospace\"><title>{}</title>{}|{}</text>",
-            COLOR_SUBTLE,
-            escape_xml(&format!(
-                "b{} / y{} cleavage",
-                row.cleavage_index, row.y_ordinal
-            )),
-            row.cleavage_index,
-            row.y_ordinal
-        );
-        write_pseudo_ion_cell(
-            svg,
-            y1_left,
-            y,
-            "start",
-            font_size,
-            value_width,
-            &row.y1,
-            neutral_loss_cutoff,
-        );
-        if let Some(x) = y2_left {
-            write_pseudo_ion_cell(
-                svg,
-                x,
-                y,
-                "start",
-                font_size,
-                value_width,
-                &row.y2,
-                neutral_loss_cutoff,
-            );
-        }
-    }
-}
-
-fn write_pseudo_ion_cell(
-    svg: &mut String,
-    x: f64,
-    y: f64,
-    anchor: &str,
-    font_size: f64,
-    max_width: f64,
-    entries: &[PseudoIonTableCell],
-    neutral_loss_cutoff: f64,
-) {
-    if entries.is_empty() {
-        return;
-    }
-    let color = entries
-        .iter()
-        .find(|entry| {
-            entry.detected()
-                && pseudo_ms2_neutral_loss_signal_is_visible(
-                    entry.summed_intensity,
-                    entry.neutral_loss,
-                    neutral_loss_cutoff,
-                )
-        })
-        .or_else(|| entries.first())
-        .map(|entry| {
-            if entry.detected()
-                && pseudo_ms2_neutral_loss_signal_is_visible(
-                    entry.summed_intensity,
-                    entry.neutral_loss,
-                    neutral_loss_cutoff,
-                )
-            {
-                pseudo_ms2_series_color(&entry.series)
-            } else {
-                "#aeb8c4"
-            }
-        })
-        .unwrap_or("#aeb8c4");
-    let title = entries
-        .iter()
-        .map(|entry| {
-            format!(
-                "{} theoretical {:.4} | summed {:.3e} | events {} | frames {} | apex RT {}",
-                entry.label,
-                entry.mz,
-                entry.summed_intensity,
-                entry.matched_events,
-                entry.frames_with_signal,
-                format_optional_f64(entry.apex_rt, 3)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let budget = mono_char_budget(font_size, max_width);
-    let text = pseudo_ion_table_visible_text(entries, budget, neutral_loss_cutoff);
-    let _ = writeln!(
-        svg,
-        "<text x=\"{x:.2}\" y=\"{y:.2}\" font-size=\"{font_size:.1}\" fill=\"{color}\" text-anchor=\"{anchor}\" font-family=\"Menlo, Consolas, Liberation Mono, monospace\"><title>{}</title>{}</text>",
-        escape_xml(&title),
-        escape_xml(&text)
-    );
-}
-
-fn pseudo_ion_table_visible_text(
-    entries: &[PseudoIonTableCell],
-    budget: usize,
-    neutral_loss_cutoff: f64,
-) -> String {
-    if budget == 0 {
-        return String::new();
-    }
-    let mut parts = Vec::new();
-    if let Some(base) = entries.iter().find(|entry| entry.neutral_loss.is_none()) {
-        parts.push(format!("{:.2}", base.mz));
-        parts.extend(
-            entries
-                .iter()
-                .filter(|entry| {
-                    entry.neutral_loss.is_some()
-                        && entry.detected()
-                        && pseudo_ms2_neutral_loss_signal_is_visible(
-                            entry.summed_intensity,
-                            entry.neutral_loss,
-                            neutral_loss_cutoff,
-                        )
-                })
-                .filter_map(|entry| {
-                    entry
-                        .neutral_loss
-                        .map(|loss| format!("+{}", neutral_loss_short_label(loss)))
-                }),
-        );
-    } else {
-        parts.extend(
-            entries
-                .iter()
-                .filter(|entry| {
-                    entry.neutral_loss.is_none()
-                        || pseudo_ms2_neutral_loss_signal_is_visible(
-                            entry.summed_intensity,
-                            entry.neutral_loss,
-                            neutral_loss_cutoff,
-                        )
-                })
-                .map(pseudo_ion_table_entry_text),
-        );
-    }
-    let text = parts.join(" ");
-    if entries.iter().any(|entry| {
-        entry.neutral_loss.is_some()
-            && entry.detected()
-            && !pseudo_ms2_neutral_loss_signal_is_visible(
-                entry.summed_intensity,
-                entry.neutral_loss,
-                neutral_loss_cutoff,
-            )
-    }) {
-        truncate_end(&format!("{text} ..."), budget)
-    } else {
-        truncate_end(&text, budget)
-    }
-}
-
-fn pseudo_ion_table_entry_text(entry: &PseudoIonTableCell) -> String {
-    match entry.neutral_loss {
-        Some(loss) => format!("{}{:.2}", neutral_loss_short_label(loss), entry.mz),
-        None => format!("{:.2}", entry.mz),
-    }
-}
-
-fn neutral_loss_rank(loss: Option<NeutralLossKind>) -> u8 {
-    match loss {
-        None => 0,
-        Some(NeutralLossKind::PhosphoricAcid) => 1,
-        Some(NeutralLossKind::Water) => 2,
-        Some(NeutralLossKind::Ammonia) => 3,
-    }
-}
-
-fn neutral_loss_short_label(loss: NeutralLossKind) -> &'static str {
-    match loss {
-        NeutralLossKind::Water => "w",
-        NeutralLossKind::Ammonia => "n",
-        NeutralLossKind::PhosphoricAcid => "p",
-    }
 }
 
 fn draw_pseudo_ms2_axes(
@@ -3700,10 +4251,11 @@ fn draw_pseudo_ms2_sticks(
     canvas: SvgCanvas,
     fragments: &[PseudoMs2FragmentEvidence],
     neutral_loss_cutoff: f64,
+    residue_count: usize,
 ) {
     let baseline = canvas.y(0.0);
-
-    for (idx, row) in fragments.iter().enumerate() {
+    let mut visible = Vec::new();
+    for row in fragments {
         if !pseudo_ms2_neutral_loss_signal_is_visible(
             row.summed_intensity,
             row.neutral_loss,
@@ -3716,28 +4268,148 @@ fn draw_pseudo_ms2_sticks(
             continue;
         }
         let y = canvas.y(row.summed_intensity);
-        let color = pseudo_ms2_series_color(&row.series);
+        let series = pseudo_fragment_series(&row.series);
+        let color = series_color(series);
+        let is_loss = row.neutral_loss.is_some();
+        let stroke_width = if is_loss { 1.6 } else { 2.8 };
+        let opacity = if is_loss { 0.68 } else { 1.0 };
+        let radius = if is_loss { 2.6 } else { 3.6 };
         let _ = writeln!(
             svg,
-            "<line x1=\"{x:.2}\" y1=\"{baseline:.2}\" x2=\"{x:.2}\" y2=\"{y:.2}\" stroke=\"{color}\" stroke-width=\"2.4\" stroke-linecap=\"round\"/>"
+            "<line x1=\"{x:.2}\" y1=\"{baseline:.2}\" x2=\"{x:.2}\" y2=\"{y:.2}\" stroke=\"{color}\" stroke-width=\"{stroke_width:.1}\" stroke-opacity=\"{opacity:.2}\" stroke-linecap=\"round\"/>"
         );
         let _ = writeln!(
             svg,
-            "<circle cx=\"{x:.2}\" cy=\"{y:.2}\" r=\"3.4\" fill=\"{color}\"><title>{}: {:.4} m/z, {:.3e}</title></circle>",
+            "<circle cx=\"{x:.2}\" cy=\"{y:.2}\" r=\"{radius:.1}\" fill=\"{color}\" fill-opacity=\"{opacity:.2}\"><title>{}: {:.4} m/z, {:.3e}</title></circle>",
             escape_xml(&row.label),
             row.mz,
             row.summed_intensity
         );
-        let label_y = (y - 10.0 - (idx % 4) as f64 * 13.0).max(canvas.top() + 14.0);
+        visible.push((row, x, y));
+    }
+
+    visible.sort_by(|left, right| {
+        left.0
+            .neutral_loss
+            .is_some()
+            .cmp(&right.0.neutral_loss.is_some())
+            .then_with(|| {
+                right
+                    .0
+                    .summed_intensity
+                    .partial_cmp(&left.0.summed_intensity)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                left.0
+                    .mz
+                    .partial_cmp(&right.0.mz)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+    let mut occupied = Vec::<LabelBounds>::new();
+    for (row, peak_x, peak_y) in visible {
+        let is_loss = row.neutral_loss.is_some();
+        let font_size = if is_loss { 11.0 } else { 12.5 };
+        let label_width = (row.label.chars().count() as f64 * font_size * 0.62).max(18.0);
+        let (label_x, label_y) =
+            place_pseudo_stick_label(peak_x, peak_y, label_width, font_size, canvas, &occupied);
+        occupied.push(LabelBounds::new(label_x, label_y, label_width, font_size));
+        if peak_y - label_y > 20.0 {
+            let _ = writeln!(
+                svg,
+                "<line x1=\"{peak_x:.2}\" y1=\"{:.2}\" x2=\"{label_x:.2}\" y2=\"{:.2}\" stroke=\"{}\" stroke-width=\"0.7\" stroke-opacity=\"0.45\"/>",
+                peak_y - 4.0,
+                label_y + 3.0,
+                series_color(pseudo_fragment_series(&row.series)),
+            );
+        }
+        let series = pseudo_fragment_series(&row.series);
+        let color = series_color(series);
+        let weight = if is_loss { "400" } else { "700" };
+        let opacity = if is_loss { "0.76" } else { "1" };
+        let markup = fragment_label_markup(
+            series,
+            if series == FragmentSeries::B {
+                row.cleavage_index
+            } else {
+                residue_count - row.cleavage_index
+            },
+            row.charge,
+            row.neutral_loss,
+            true,
+        );
         let _ = writeln!(
             svg,
-            "<text x=\"{x:.2}\" y=\"{label_y:.2}\" font-size=\"12\" text-anchor=\"middle\" fill=\"{color}\" font-family=\"Menlo, Consolas, Liberation Mono, monospace\"><title>{}: {:.4} m/z, {:.3e}</title>{}</text>",
+            "<text x=\"{label_x:.2}\" y=\"{label_y:.2}\" font-size=\"{font_size:.1}\" font-weight=\"{weight}\" text-anchor=\"middle\" fill=\"{color}\" fill-opacity=\"{opacity}\" font-family=\"Menlo, Consolas, Liberation Mono, monospace\"><title>{}: {:.4} m/z, {:.3e}</title>{markup}</text>",
             escape_xml(&row.label),
             row.mz,
             row.summed_intensity,
-            escape_xml(&row.label),
         );
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LabelBounds {
+    left: f64,
+    right: f64,
+    top: f64,
+    bottom: f64,
+}
+
+impl LabelBounds {
+    fn new(x: f64, baseline_y: f64, width: f64, font_size: f64) -> Self {
+        Self {
+            left: x - width / 2.0 - 3.0,
+            right: x + width / 2.0 + 3.0,
+            top: baseline_y - font_size - 2.0,
+            bottom: baseline_y + 4.0,
+        }
+    }
+
+    fn intersects(self, other: Self) -> bool {
+        self.left < other.right
+            && self.right > other.left
+            && self.top < other.bottom
+            && self.bottom > other.top
+    }
+}
+
+fn place_pseudo_stick_label(
+    peak_x: f64,
+    peak_y: f64,
+    width: f64,
+    font_size: f64,
+    canvas: SvgCanvas,
+    occupied: &[LabelBounds],
+) -> (f64, f64) {
+    let top = canvas.top() + font_size + 3.0;
+    let preferred = (peak_y - 10.0).max(top);
+    let vertical_lanes = ((preferred - top) / 14.0).floor().max(0.0) as usize;
+    let horizontal_step = width + 8.0;
+    let x_offsets = [
+        0.0,
+        -horizontal_step,
+        horizontal_step,
+        -2.0 * horizontal_step,
+        2.0 * horizontal_step,
+    ];
+    for lane in 0..=vertical_lanes {
+        let y = preferred - lane as f64 * 14.0;
+        for offset in x_offsets {
+            let x = (peak_x + offset)
+                .max(canvas.left() + width / 2.0 + 2.0)
+                .min(canvas.right() - width / 2.0 - 2.0);
+            let bounds = LabelBounds::new(x, y, width, font_size);
+            if occupied.iter().all(|other| !bounds.intersects(*other)) {
+                return (x, y);
+            }
+        }
+    }
+    let x = peak_x
+        .max(canvas.left() + width / 2.0 + 2.0)
+        .min(canvas.right() - width / 2.0 - 2.0);
+    (x, top)
 }
 
 fn draw_pseudo_ms2_legend(svg: &mut String, x: f64, y: f64) {
@@ -3762,11 +4434,11 @@ fn draw_pseudo_ms2_legend(svg: &mut String, x: f64, y: f64) {
     }
 }
 
-fn pseudo_ms2_series_color(series: &str) -> &'static str {
-    match series {
-        "b" => "#1d4ed8",
-        "y" => "#b45309",
-        _ => "#475569",
+fn pseudo_fragment_series(series: &str) -> FragmentSeries {
+    if series == "y" {
+        FragmentSeries::Y
+    } else {
+        FragmentSeries::B
     }
 }
 
@@ -3900,38 +4572,32 @@ fn write_summary_svg(
     let filter_line = match &request.peptide_target {
         Some(target) => match &target.fragment {
             Some(fragment) => format!(
-                "Target: {}/{} fragment {} m/z {:.4} | precursor m/z {:.4} | window {:.4}-{:.4} | RT {}",
+                "Target: {}/{} fragment {} m/z {:.4} | precursor m/z {:.4}",
                 target.modified_sequence,
                 target.charge,
                 fragment.label,
                 fragment.mz,
                 target.precursor_mz,
-                summary.mz_min,
-                summary.mz_max,
-                request.rt_window_label(),
             ),
             None => format!(
-                "Target: {}/{} precursor m/z {:.4} | window {:.4}-{:.4} | RT {}",
-                target.modified_sequence,
-                target.charge,
-                target.precursor_mz,
-                summary.mz_min,
-                summary.mz_max,
-                request.rt_window_label(),
+                "Target: {}/{} precursor m/z {:.4}",
+                target.modified_sequence, target.charge, target.precursor_mz,
             ),
         },
-        None => format!(
-            "Target: m/z {:.4} | window {:.4}-{:.4} | RT {}",
-            request.mz,
-            summary.mz_min,
-            summary.mz_max,
-            request.rt_window_label(),
-        ),
+        None => format!("Target: m/z {:.4}", request.mz),
     };
     let data_context =
         compact_backend_label(summary.backend_label, summary.acquisition_mode.as_deref());
-    let capability_context = compact_capability_label(summary.capabilities);
-    let acquisition_line = format!("{filter_line} | {data_context} | {capability_context}",);
+    let mut acquisition_context = vec![filter_line];
+    if let (Some(quad_min), Some(quad_max)) = (request.quad_min, request.quad_max) {
+        acquisition_context.push(format!("Quad window {quad_min:.4}-{quad_max:.4} m/z"));
+    }
+    acquisition_context.push(match (request.rt_min, request.rt_max) {
+        (Some(_), Some(_)) => format!("RT {}", request.rt_window_label()),
+        _ => "all RT".to_string(),
+    });
+    acquisition_context.push(data_context);
+    let acquisition_line = acquisition_context.join(" | ");
     let counts_line = format!(
         "Spectra considered: {} | With signal: {} | Matched peaks: {}",
         summary.spectra_considered, summary.spectra_with_signal, summary.matched_peaks,
@@ -4447,19 +5113,6 @@ fn truncate_middle(value: &str, max_chars: usize) -> String {
     format!("{left}...{right}")
 }
 
-fn truncate_end(value: &str, max_chars: usize) -> String {
-    let count = value.chars().count();
-    if count <= max_chars {
-        return value.to_string();
-    }
-    if max_chars <= 3 {
-        return ".".repeat(max_chars);
-    }
-    let keep = max_chars - 3;
-    let prefix = value.chars().take(keep).collect::<String>();
-    format!("{prefix}...")
-}
-
 fn gaussian_smooth_points(points: &[(f64, f64)], window_points: usize) -> Vec<(f64, f64)> {
     if points.len() < 3 || window_points <= 1 {
         return points.to_vec();
@@ -4732,7 +5385,11 @@ mod tests {
 
         acc.add_frame(&ms1);
         acc.add_frame(&ms2);
-        let summary = acc.finalize(Path::new("run.d"), "diaPASEF".to_string());
+        let summary = acc.finalize(
+            Path::new("run.d"),
+            "diaPASEF".to_string(),
+            super::TIMSRUST_CORRECTED_INTENSITY,
+        );
 
         assert_eq!(summary.schema_version, 1);
         assert_eq!(summary.total_frames, 2);
@@ -4870,6 +5527,50 @@ mod tests {
     }
 
     #[test]
+    fn parse_args_emit_trace_implies_trace_peaks() {
+        let options = parse_args(vec![
+            "--mzml".into(),
+            "demo.mzML".into(),
+            "--mz".into(),
+            "500".into(),
+            "--emit-trace".into(),
+        ])
+        .expect("trace options parse");
+        assert!(options.trace_peaks);
+        assert!(options.emit_trace);
+    }
+
+    #[test]
+    fn parse_args_accepts_trace_peak_tuning_options() {
+        let options = parse_args(vec![
+            "--mzml".into(),
+            "demo.mzML".into(),
+            "--mz".into(),
+            "500".into(),
+            "--trace-peak-smooth-window".into(),
+            "5".into(),
+            "--trace-peak-snr".into(),
+            "2.5".into(),
+            "--trace-peak-boundary-snr".into(),
+            "0.5".into(),
+            "--trace-peak-boundary-fraction".into(),
+            "0.35".into(),
+            "--trace-peak-min-points".into(),
+            "4".into(),
+            "--trace-peak-min-nonzero".into(),
+            "3".into(),
+        ])
+        .expect("trace tuning options parse");
+        assert!(options.trace_peaks);
+        assert_eq!(options.trace_peak_smooth_window_points, 5);
+        assert!((options.trace_peak_signal_to_noise - 2.5).abs() < 1e-9);
+        assert!((options.trace_peak_boundary_signal_to_noise - 0.5).abs() < 1e-9);
+        assert!((options.trace_peak_boundary_fraction - 0.35).abs() < 1e-9);
+        assert_eq!(options.trace_peak_min_points, 4);
+        assert_eq!(options.trace_peak_min_nonzero_points, 3);
+    }
+
+    #[test]
     fn gaussian_smooth_points_preserves_x_and_reduces_spike() {
         let points = vec![(0.0, 0.0), (1.0, 10.0), (2.0, 0.0)];
         let smoothed = super::gaussian_smooth_points(&points, 3);
@@ -4878,6 +5579,96 @@ mod tests {
         assert!(smoothed[1].1 > 6.0);
         assert!(smoothed[1].1 < 10.0);
         assert!(smoothed[0].1 > 0.0);
+    }
+
+    #[test]
+    fn call_trace_peaks_detects_simple_peak() {
+        let intensities = [0.0, 0.0, 10.0, 40.0, 100.0, 40.0, 10.0, 0.0, 0.0];
+        let trace = intensities
+            .iter()
+            .enumerate()
+            .map(|(idx, intensity)| super::TracePoint {
+                scan_index: idx as u32,
+                scan_id: format!("scan={idx}"),
+                rt_minutes: Some(idx as f64 * 0.1),
+                target_intensity: *intensity,
+                matched_events: (*intensity > 0.0) as usize,
+                ms2_frame_tic: Some(1000.0 + *intensity),
+            })
+            .collect::<Vec<_>>();
+
+        let peaks = super::call_trace_peaks(&trace, super::TracePeakOptions::default());
+        assert_eq!(peaks.len(), 1);
+        let peak = &peaks[0];
+        assert_eq!(peak.scan_apex, 4);
+        assert_eq!(peak.n_nonzero_points, 5);
+        assert!(peak.signal_to_noise > super::DEFAULT_TRACE_PEAK_SIGNAL_TO_NOISE);
+        assert!(peak.peak_area_baseline_corrected > 0.0);
+        assert!(peak.fwhm_min.is_some());
+        assert!(peak.peak_width_min.is_some());
+        assert!(peak.fwhm_to_width_ratio.is_some());
+    }
+
+    #[test]
+    fn call_trace_peaks_splits_broad_region_with_two_apices() {
+        let intensities = [
+            0.0, 0.0, 8.0, 35.0, 120.0, 45.0, 25.0, 40.0, 110.0, 35.0, 8.0, 0.0,
+        ];
+        let trace = intensities
+            .iter()
+            .enumerate()
+            .map(|(idx, intensity)| super::TracePoint {
+                scan_index: idx as u32,
+                scan_id: format!("scan={idx}"),
+                rt_minutes: Some(idx as f64 * 0.1),
+                target_intensity: *intensity,
+                matched_events: (*intensity > 0.0) as usize,
+                ms2_frame_tic: Some(1000.0 + *intensity),
+            })
+            .collect::<Vec<_>>();
+
+        let options = super::TracePeakOptions {
+            smooth_window_points: 3,
+            signal_to_noise: 2.0,
+            boundary_fraction: 0.25,
+            ..super::TracePeakOptions::default()
+        };
+        let peaks = super::call_trace_peaks(&trace, options);
+        assert_eq!(peaks.len(), 2);
+        assert_eq!(peaks[0].scan_apex, 4);
+        assert_eq!(peaks[1].scan_apex, 8);
+        assert!(peaks
+            .iter()
+            .all(|peak| peak.fwhm_to_width_ratio.unwrap_or(0.0) <= 1.0));
+    }
+
+    #[test]
+    fn call_trace_peaks_does_not_duplicate_broad_boundary_region() {
+        let intensities = [
+            0.0, 0.0, 0.0, 0.0, 0.391576, 0.0, 0.0, 0.0, 0.391576, 0.957854, 0.0, 1.108460,
+            1.289188, 0.0, 0.0, 0.240970, 0.0, 0.373503, 0.0, 1.060267, 0.734957, 0.0, 1.981975,
+            0.0, 0.0, 1.168703, 0.0, 0.0, 0.397600, 0.415673, 0.204824, 0.801224, 0.921709, 0.0,
+            0.0, 0.439770, 0.475915, 0.0, 2.578375, 0.0, 0.590376, 0.0, 0.0, 0.114461, 0.0, 0.0,
+        ];
+        let trace = intensities
+            .iter()
+            .enumerate()
+            .map(|(idx, intensity)| super::TracePoint {
+                scan_index: 3480 + idx as u32,
+                scan_id: format!("frame={}", 3480 + idx),
+                rt_minutes: Some(10.069097 + idx as f64 * 0.002876),
+                target_intensity: *intensity,
+                matched_events: (*intensity > 0.0) as usize,
+                ms2_frame_tic: Some(1000.0 + *intensity),
+            })
+            .collect::<Vec<_>>();
+
+        let peaks = super::call_trace_peaks(&trace, super::TracePeakOptions::default());
+        assert!(!peaks.is_empty());
+        assert!(peaks.iter().all(|peak| peak.apex_intensity > 0.0));
+        assert!(peaks
+            .windows(2)
+            .all(|pair| pair[0].scan_end < pair[1].scan_start));
     }
 
     #[test]
@@ -4954,34 +5745,51 @@ mod tests {
             fragments,
         };
 
-        let rows = super::build_pseudo_ion_table_rows(&report);
-        let row = rows.iter().find(|row| row.y_ordinal == 3).expect("y3 row");
-        assert!(row.y1.iter().any(super::PseudoIonTableCell::detected));
-        assert!(!row.b1.iter().any(super::PseudoIonTableCell::detected));
+        let table = super::build_pseudo_ion_table(&report, 0.0);
+        let row = table
+            .rows
+            .iter()
+            .find(|row| row.c_position == 3)
+            .expect("y3 row");
+        assert!(row
+            .y
+            .get(&1)
+            .expect("y+ cell")
+            .entries
+            .iter()
+            .any(|entry| entry.detected));
+        assert!(!row
+            .b
+            .get(&1)
+            .expect("b+ cell")
+            .entries
+            .iter()
+            .any(|entry| entry.detected));
 
         let mut svg = String::new();
-        let width = super::pseudo_ion_table_width(&rows);
-        let height = super::pseudo_ion_table_height(rows.len());
-        super::draw_pseudo_ms2_ion_table(
-            &mut svg,
-            0.0,
-            0.0,
-            width,
-            height,
-            &rows,
-            &report.peptide.sequence,
-            0.0,
-        );
+        let layout = table.layout(1200.0);
+        table.render(&mut svg, 0.0, 0.0, &layout);
         assert!(svg.contains("Pseudo-MS2 ion table"));
-        assert!(svg.contains("color = DIA evidence"));
+        assert!(svg.contains("colored = DIA evidence"));
         assert!(svg.contains("y3 theoretical"));
         assert!(svg.contains("neutral losses with at least 3% of max fragment signal"));
+        assert!(svg.contains("baseline-shift=\"sub\" font-size=\"75%\">3</tspan>"));
     }
 
     #[test]
-    fn pseudo_ms2_ion_table_height_keeps_single_long_ladder() {
-        let row_height = super::pseudo_ion_table_row_height(13);
-        assert!((super::pseudo_ion_table_height(13) - (180.0 + 13.0 * row_height)).abs() < 1e-9);
+    fn peptide_target_keeps_modified_residue_labels_for_the_table() {
+        let target = super::resolve_peptide_target(
+            "NDLEVMQILVSGGAK/2",
+            None,
+            &["6:15.994915".to_string()],
+            None,
+            &[],
+        )
+        .expect("modified peptide target");
+
+        assert_eq!(target.residue_labels.len(), 15);
+        assert_eq!(target.residue_labels[5], "M[+15.994915]");
+        assert_eq!(target.modified_sequence, "NDLEVM[+15.994915]QILVSGGAK");
     }
 
     #[test]
@@ -5036,11 +5844,11 @@ mod tests {
             CoordinateRange::new(0.0, 1000.0),
         );
         let mut svg = String::new();
-        super::draw_pseudo_ms2_sticks(&mut svg, canvas, &fragments, 0.0);
+        super::draw_pseudo_ms2_sticks(&mut svg, canvas, &fragments, 0.0, 2);
 
-        assert!(svg.contains(">b1</text>"));
-        assert!(svg.contains(">y1</text>"));
-        assert!(!svg.contains(">b2</text>"));
+        assert!(svg.contains(">b<tspan baseline-shift=\"sub\" font-size=\"75%\">1</tspan>"));
+        assert!(svg.contains(">y<tspan baseline-shift=\"sub\" font-size=\"75%\">1</tspan>"));
+        assert!(!svg.contains(">b<tspan baseline-shift=\"sub\" font-size=\"75%\">2</tspan>"));
         assert!(!svg.contains("#aeb8c4"));
     }
 
@@ -5098,11 +5906,11 @@ mod tests {
             CoordinateRange::new(0.0, 1000.0),
         );
         let mut svg = String::new();
-        super::draw_pseudo_ms2_sticks(&mut svg, canvas, &fragments, cutoff);
+        super::draw_pseudo_ms2_sticks(&mut svg, canvas, &fragments, cutoff, 2);
 
-        assert!(svg.contains(">b1</text>"));
-        assert!(svg.contains(">y1-H3PO4</text>"));
-        assert!(!svg.contains(">b1-H3PO4</text>"));
+        assert!(svg.contains(">b<tspan baseline-shift=\"sub\" font-size=\"75%\">1</tspan>"));
+        assert!(svg.contains("&#8722;H<tspan baseline-shift=\"sub\" font-size=\"75%\">3</tspan>PO<tspan baseline-shift=\"sub\" font-size=\"75%\">4</tspan>"));
+        assert_eq!(svg.matches("&#8722;H<tspan").count(), 1);
     }
 
     #[test]
