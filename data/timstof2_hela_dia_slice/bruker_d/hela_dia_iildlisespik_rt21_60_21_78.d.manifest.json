@@ -1,0 +1,11 @@
+{
+  "source_d": "data/timstof2_hela/DIA/99992_111_TOF_HeLa_DIA_20ng_Apr18_calib_610.d",
+  "out_d": "data/timstof2_hela_dia_slice/bruker_d/hela_dia_iildlisespik_rt21_60_21_78.d",
+  "source_frame_start": 12156,
+  "source_frame_end": 12255,
+  "frame_count": 100,
+  "source_rt_start_min": 21.600683266666667,
+  "source_rt_end_min": 21.776544066666666,
+  "target_label": "IILDLISESPIK/2",
+  "renumbered_frames": "Frames.Id rewritten to 1..N; source frame ids retained only in this manifest"
+}

@@ -1,2 +1,6 @@
 data/**/*.mzML filter=lfs diff=lfs merge=lfs -text
 data/**/*.mzml filter=lfs diff=lfs merge=lfs -text
+data/**/analysis.tdf filter=lfs diff=lfs merge=lfs -text
+data/**/analysis.tdf_bin filter=lfs diff=lfs merge=lfs -text
+data/**/HyStarMetadata.xml -text -diff
+data/**/SampleInfo.xml -text -diff

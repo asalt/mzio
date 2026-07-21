@@ -24,6 +24,8 @@ data/_sources/
 data/_sources/**
 data/_work/
 data/_work/**
+data/timstof2_hela/
+data/timstof2_hela/**
 
 .codex
 .codex/*

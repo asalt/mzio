@@ -1,0 +1,2 @@
+fixture	source_d	source_frames	source_rt_min	source_rt_max	peptide	precursor_mz	notes
+bruker_d/hela_dia_iildlisespik_rt21_60_21_78.d	data/timstof2_hela/DIA/99992_111_TOF_HeLa_DIA_20ng_Apr18_calib_610.d	12156-12255	21.6007	21.7765	IILDLISESPIK/2	670.905411	slim native Bruker diaPASEF fixture; Frames.Id renumbered to 1..N
