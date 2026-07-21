@@ -1,6 +1,7 @@
 mod annotate;
 mod dia;
 mod diagnostics;
+mod ion_table;
 mod ms2;
 mod mzml;
 mod pepxml;

@@ -263,6 +263,10 @@ impl AnnotationContext {
     }
 
     pub(crate) fn modified_sequence(&self) -> String {
+        self.modified_residue_labels().concat()
+    }
+
+    pub(crate) fn modified_residue_labels(&self) -> Vec<String> {
         let mut residue_mods = vec![Vec::<String>::new(); self.peptide.len()];
         let mut n_term_mods = Vec::<String>::new();
         let mut c_term_mods = Vec::<String>::new();
@@ -282,20 +286,26 @@ impl AnnotationContext {
             }
         }
 
-        let mut out = String::new();
-        for value in n_term_mods {
-            out.push_str(&value);
-        }
+        let mut labels = self
+            .peptide
+            .residue_chars()
+            .iter()
+            .map(char::to_string)
+            .collect::<Vec<_>>();
         for (idx, aa) in self.peptide.residue_chars().iter().copied().enumerate() {
-            out.push(aa);
+            let mut label = aa.to_string();
             for value in &residue_mods[idx] {
-                out.push_str(value);
+                label.push_str(value);
             }
+            labels[idx] = label;
         }
-        for value in c_term_mods {
-            out.push_str(&value);
+        if let Some(first) = labels.first_mut() {
+            *first = format!("{}{}", n_term_mods.concat(), first);
         }
-        out
+        if let Some(last) = labels.last_mut() {
+            last.push_str(&c_term_mods.concat());
+        }
+        labels
     }
 }
 

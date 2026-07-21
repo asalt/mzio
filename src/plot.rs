@@ -15,6 +15,10 @@ use crate::annotate::{
     AnnotationQualityMetrics, AnnotationReport, FragmentIon, FragmentMatch, FragmentSeries,
     MassTolerance, NeutralLossKind, PrecursorCheck, DEFAULT_PRECURSOR_ISOTOPE_ERRORS,
 };
+use crate::ion_table::{
+    fragment_label_markup, series_color as ion_series_color, SvgIonTable, SvgIonTableCell,
+    SvgIonTableEntry, SvgIonTableRow,
+};
 use crate::ms2::load_selected_spectrum as load_selected_ms2_spectrum;
 use crate::mzml::{
     extract_scan_number, load_selected_spectrum as load_selected_mzml_spectrum, open_reader,
@@ -27,9 +31,6 @@ use crate::svg_canvas::{AxisOrientation, AxisProps, AxisTickLabelStyle, SvgCanva
 const SVG_WIDTH: u32 = 1480;
 const SVG_HEIGHT: u32 = 940;
 const SVG_BINS: usize = 4000;
-const ION_TABLE_MIN_WIDTH: f64 = 620.0;
-const ION_TABLE_MAX_EXTRA_WIDTH: f64 = 520.0;
-const ION_TABLE_GAP: f64 = 18.0;
 const PLOT_HEADER_TITLE_FONT: u32 = 20;
 const PLOT_HEADER_META_FONT: u32 = 14;
 const PLOT_HEADER_DETAIL_FONT: u32 = 15;
@@ -41,9 +42,6 @@ const LADDER_TITLE_FONT: u32 = 14;
 const LADDER_RESIDUE_FONT: u32 = 22;
 const LADDER_INDEX_FONT: u32 = 12;
 const LADDER_ION_FONT: u32 = 13;
-const ION_TABLE_TITLE_FONT: u32 = 18;
-const ION_TABLE_META_FONT: u32 = 13;
-const ION_TABLE_HEADER_FONT: f64 = 13.5;
 const COLOR_TEXT: &str = "#122033";
 const COLOR_SUBTLE: &str = "#5b6775";
 const COLOR_WARNING: &str = "#b45309";
@@ -53,7 +51,6 @@ const COLOR_SERIES_NEUTRAL: &str = "#94a3b8";
 const COLOR_PLOT: &str = "#0f766e";
 const COLOR_CARD_BORDER: &str = "#d8e0ea";
 const COLOR_AXIS: &str = "#334155";
-const FONT_TABLE: &str = "Menlo, Consolas, Liberation Mono, monospace";
 const DEFAULT_TOLERANCE: MassTolerance = MassTolerance::Ppm(20.0);
 const COMMON_NEUTRAL_LOSSES: [NeutralLossKind; 3] = [
     NeutralLossKind::Water,
@@ -153,7 +150,10 @@ struct PeakLabel {
 
 #[derive(Clone, Debug)]
 struct PeakLabelText {
-    text: String,
+    series: FragmentSeries,
+    ordinal: usize,
+    charge: u8,
+    neutral_loss: Option<NeutralLossKind>,
     color: &'static str,
     title: String,
 }
@@ -169,37 +169,6 @@ enum RulerTickKind {
 struct RulerTick {
     value: f64,
     kind: RulerTickKind,
-}
-
-#[derive(Clone, Debug)]
-struct IonTableRow {
-    cleavage_index: usize,
-    y_ordinal: usize,
-    b1: IonTableCell,
-    b2: IonTableCell,
-    y2: IonTableCell,
-    y1: IonTableCell,
-}
-
-#[derive(Clone, Debug, Default)]
-struct IonTableCell {
-    entries: Vec<IonTableEntry>,
-}
-
-#[derive(Clone, Debug)]
-struct IonTableEntry {
-    text: String,
-    color: &'static str,
-    title: String,
-    matched: bool,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct IonTableLayout {
-    width: f64,
-    cut_width: f64,
-    pad: f64,
-    value_columns: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1405,7 +1374,7 @@ fn write_spectrum_svg(
     } else {
         0.0
     };
-    let ion_table_rows = annotation_report.map(build_ion_table_rows);
+    let ion_table = annotation_report.map(build_ion_table);
 
     let margin_left = 116.0;
     let margin_right = 28.0;
@@ -1418,25 +1387,20 @@ fn write_spectrum_svg(
 
     let base_w = width as f64;
     let base_h = height as f64;
-    let plot_w = (base_w - margin_left - margin_right).max(1.0);
-    let ion_table_width = ion_table_rows
+    let base_plot_w = (base_w - margin_left - margin_right).max(1.0);
+    let ion_table_layout = ion_table.as_ref().map(|table| table.layout(base_plot_w));
+    let plot_w = ion_table_layout
         .as_ref()
-        .map(|rows| estimate_ion_table_width(rows, base_w))
-        .unwrap_or(0.0);
-    let extra_width = if ion_table_rows.is_some() {
-        ION_TABLE_GAP + ion_table_width
-    } else {
-        0.0
-    };
-    let table_required_height = ion_table_rows
+        .map(|layout| layout.width)
+        .unwrap_or(base_plot_w)
+        .max(base_plot_w);
+    let plot_h = (base_h - plot_top - margin_bottom).max(1.0);
+    let table_top = plot_top + plot_h + margin_bottom;
+    let total_w = margin_left + plot_w + margin_right;
+    let total_h = ion_table_layout
         .as_ref()
-        .map(|rows| ion_table_content_height(rows.len()))
-        .unwrap_or(0.0);
-    let plot_h = (base_h - plot_top - margin_bottom)
-        .max(table_required_height)
-        .max(1.0);
-    let total_w = base_w + extra_width;
-    let total_h = plot_top + plot_h + margin_bottom;
+        .map(|layout| table_top + layout.height + 34.0)
+        .unwrap_or(plot_top + plot_h + margin_bottom);
     let svg_w = total_w.ceil() as u32;
     let svg_h = total_h.ceil() as u32;
 
@@ -1489,7 +1453,6 @@ fn write_spectrum_svg(
         )?;
     }
 
-    let table_left = margin_left + plot_w + (extra_width - ion_table_width);
     if let Some(report) = annotation_report {
         draw_ladder(
             &mut file,
@@ -1617,14 +1580,23 @@ fn write_spectrum_svg(
             for &(x, y) in points {
                 let (px, py) = plot_canvas.transform(x, y);
                 let (px0, py0) = plot_canvas.transform(x, 0.0);
+                let (stroke, class_name, stroke_width) = annotation_report
+                    .and_then(|report| matched_peak_series(report, x))
+                    .map(|series| match series {
+                        FragmentSeries::B => (series_color(series), "spectrum-peak-matched-b", 1.7),
+                        FragmentSeries::Y => (series_color(series), "spectrum-peak-matched-y", 1.7),
+                    })
+                    .unwrap_or((COLOR_PLOT, "spectrum-peak-unmatched", 1.0));
                 writeln!(
                     file,
-                    r##"<line x1="{x1:.2}" y1="{y1:.2}" x2="{x2:.2}" y2="{y2:.2}" stroke="{stroke}" stroke-width="1"/>"##,
+                    r##"<line class="spectrum-peak {class_name}" x1="{x1:.2}" y1="{y1:.2}" x2="{x2:.2}" y2="{y2:.2}" stroke="{stroke}" stroke-width="{stroke_width:.1}"/>"##,
+                    class_name = class_name,
                     x1 = px0,
                     y1 = py0,
                     x2 = px,
                     y2 = py,
-                    stroke = COLOR_PLOT,
+                    stroke = stroke,
+                    stroke_width = stroke_width,
                 )?;
             }
         }
@@ -1648,53 +1620,23 @@ fn write_spectrum_svg(
     }
 
     if let Some(report) = annotation_report {
-        for peak_label in collect_peak_labels(
-            report,
-            spectrum,
-            normalize,
-            x_bounds,
-            neutral_loss_label_min_frac,
-        ) {
-            let (px, py) =
-                plot_canvas.transform(peak_label.observed_mz, peak_label.display_intensity);
-            for (rank, label) in peak_label.labels.iter().enumerate() {
-                let text_y = (py - 10.0 - rank as f64 * 12.0).max(plot_canvas.top() + 12.0);
-                let use_end_anchor = px > plot_canvas.right() - 90.0;
-                let text_x = if use_end_anchor { px - 4.0 } else { px + 4.0 };
-                let anchor = if use_end_anchor { "end" } else { "start" };
-                writeln!(
-                    file,
-                    r##"<line x1="{x:.2}" y1="{y1:.2}" x2="{x:.2}" y2="{y2:.2}" stroke="{stroke}" stroke-width="0.8" stroke-opacity="0.6"/>"##,
-                    x = px,
-                    y1 = py,
-                    y2 = text_y + 2.0,
-                    stroke = label.color,
-                )?;
-                writeln!(
-                    file,
-                    r##"<text x="{x:.2}" y="{y:.2}" font-family="Helvetica, Arial, sans-serif" font-size="{font}" fill="{fill}" text-anchor="{anchor}"><title>{title}</title>{text}</text>"##,
-                    x = text_x,
-                    y = text_y,
-                    font = PLOT_PEAK_LABEL_FONT,
-                    fill = label.color,
-                    anchor = anchor,
-                    title = escape_xml(&label.title),
-                    text = escape_xml(&label.text),
-                )?;
-            }
-        }
+        draw_fragment_peak_labels(
+            &mut file,
+            &collect_peak_labels(
+                report,
+                spectrum,
+                normalize,
+                x_bounds,
+                neutral_loss_label_min_frac,
+            ),
+            plot_canvas,
+        )?;
     }
 
-    if let (Some(report), Some(rows)) = (annotation_report, ion_table_rows.as_ref()) {
-        draw_ion_table(
-            &mut file,
-            table_left,
-            plot_top,
-            ion_table_width,
-            plot_h,
-            report,
-            rows,
-        )?;
+    if let (Some(table), Some(layout)) = (ion_table.as_ref(), ion_table_layout.as_ref()) {
+        let mut table_svg = String::new();
+        table.render(&mut table_svg, margin_left, table_top, layout);
+        file.write_all(table_svg.as_bytes())?;
     }
     writeln!(
         file,
@@ -2120,117 +2062,76 @@ fn join_site_label_titles(labels: &[SiteLabel]) -> String {
         .join(" | ")
 }
 
-fn ion_table_content_height(row_count: usize) -> f64 {
-    let row_height = ion_table_row_height(row_count);
-    92.0 + row_count as f64 * row_height + 34.0
-}
-
-fn ion_table_row_height(row_count: usize) -> f64 {
-    if row_count <= 18 {
-        32.0
-    } else if row_count <= 28 {
-        27.0
-    } else {
-        23.0
-    }
-}
-
-fn ion_table_cell_summary_text(entries: &[IonTableEntry]) -> String {
-    entries
-        .iter()
-        .map(|entry| entry.text.as_str())
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn estimate_text_width(text: &str, font_size: f64) -> f64 {
-    let visible_chars = text.chars().count() as f64;
-    visible_chars * font_size * 0.62
-}
-
-fn estimate_ion_table_width(rows: &[IonTableRow], base_width: f64) -> f64 {
-    let layout = estimate_ion_table_layout(rows);
-    let max_width = ION_TABLE_MIN_WIDTH + ION_TABLE_MAX_EXTRA_WIDTH.min(base_width * 0.35);
-    layout.width.clamp(ION_TABLE_MIN_WIDTH, max_width)
-}
-
-fn estimate_ion_table_layout(rows: &[IonTableRow]) -> IonTableLayout {
-    let font_size = ion_table_font_size(rows.len());
-    let pad = 20.0;
-    let cut_width = 58.0;
-    let column_gap = 14.0;
-    let show_charge2 = ion_table_has_charge2(rows);
-    let value_columns = if show_charge2 { 4 } else { 2 };
-    let header_labels: &[&str] = if show_charge2 {
-        &["b++", "b+", "y+", "y++"]
-    } else {
-        &["b+", "y+"]
-    };
-    let mut max_value_width = header_labels
-        .iter()
-        .map(|label| estimate_text_width(label, ION_TABLE_HEADER_FONT))
-        .fold(0.0_f64, f64::max);
-
-    for row in rows {
-        let cells: Vec<&IonTableCell> = if show_charge2 {
-            vec![&row.b1, &row.b2, &row.y2, &row.y1]
-        } else {
-            vec![&row.b1, &row.y1]
-        };
-        for cell in cells {
-            max_value_width = max_value_width.max(estimate_text_width(
-                &ion_table_cell_summary_text(&cell.entries),
-                font_size,
-            ));
-        }
-    }
-
-    let width = pad * 2.0
-        + cut_width
-        + max_value_width * value_columns as f64
-        + column_gap * value_columns as f64;
-    IonTableLayout {
-        width,
-        cut_width,
-        pad,
-        value_columns,
-    }
-}
-
-fn ion_table_has_charge2(rows: &[IonTableRow]) -> bool {
-    rows.iter()
-        .any(|row| !row.b2.entries.is_empty() || !row.y2.entries.is_empty())
-}
-
-fn ion_table_font_size(row_count: usize) -> f64 {
-    if row_count <= 18 {
-        15.0
-    } else if row_count <= 28 {
-        13.0
-    } else {
-        11.5
-    }
-}
-
-fn build_ion_table_rows(report: &AnnotationReport) -> Vec<IonTableRow> {
+fn build_ion_table(report: &AnnotationReport) -> SvgIonTable {
     let mut match_by_key = HashMap::<IonKey, &FragmentMatch>::new();
     for matched in &report.matches {
         match_by_key.insert(fragment_key(&matched.fragment), matched);
     }
-
     let residue_count = report.context.peptide.len();
-    let mut rows = Vec::with_capacity(residue_count.saturating_sub(1));
-    for cleavage_index in 1..residue_count {
-        rows.push(IonTableRow {
-            cleavage_index,
-            y_ordinal: residue_count - cleavage_index,
-            b1: build_ion_table_cell(report, &match_by_key, FragmentSeries::B, cleavage_index, 1),
-            b2: build_ion_table_cell(report, &match_by_key, FragmentSeries::B, cleavage_index, 2),
-            y2: build_ion_table_cell(report, &match_by_key, FragmentSeries::Y, cleavage_index, 2),
-            y1: build_ion_table_cell(report, &match_by_key, FragmentSeries::Y, cleavage_index, 1),
+    let charges = report
+        .fragments
+        .iter()
+        .map(|fragment| fragment.charge)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let residue_labels = report.context.modified_residue_labels();
+    let mut rows = Vec::with_capacity(residue_count);
+    for position in 1..=residue_count {
+        let mut b = BTreeMap::new();
+        let mut y = BTreeMap::new();
+        for charge in &charges {
+            if position < residue_count {
+                b.insert(
+                    *charge,
+                    build_ion_table_cell(
+                        report,
+                        &match_by_key,
+                        FragmentSeries::B,
+                        position,
+                        position,
+                        *charge,
+                    ),
+                );
+            }
+            if position > 1 {
+                let cleavage_index = position - 1;
+                y.insert(
+                    *charge,
+                    build_ion_table_cell(
+                        report,
+                        &match_by_key,
+                        FragmentSeries::Y,
+                        cleavage_index,
+                        residue_count - cleavage_index,
+                        *charge,
+                    ),
+                );
+            }
+        }
+        rows.push(SvgIonTableRow {
+            n_position: position,
+            c_position: residue_count - position + 1,
+            residue_label: residue_labels
+                .get(position - 1)
+                .cloned()
+                .unwrap_or_default(),
+            b,
+            y,
         });
     }
-    rows
+
+    SvgIonTable {
+        title: "Full ion table".to_string(),
+        evidence_legend: "colored = matched evidence; grey = unmatched theoretical base ion"
+            .to_string(),
+        loss_legend: "loss lines = matched evidence: \u{2212}H\u{2082}O water, \u{2212}NH\u{2083} ammonia, \u{2212}H\u{2083}PO\u{2084} phosphoric acid"
+            .to_string(),
+        sequence: report.context.modified_sequence(),
+        footer_note: None,
+        charges,
+        rows,
+    }
 }
 
 fn build_ion_table_cell(
@@ -2238,8 +2139,9 @@ fn build_ion_table_cell(
     match_by_key: &HashMap<IonKey, &FragmentMatch>,
     series: FragmentSeries,
     cleavage_index: usize,
+    ordinal: usize,
     charge: u8,
-) -> IonTableCell {
+) -> SvgIonTableCell {
     let mut fragments = report
         .fragments
         .iter()
@@ -2250,32 +2152,32 @@ fn build_ion_table_cell(
         })
         .collect::<Vec<_>>();
     fragments.sort_by(|left, right| {
-        neutral_loss_rank(left.neutral_loss)
-            .cmp(&neutral_loss_rank(right.neutral_loss))
-            .then_with(|| {
-                left.theoretical_mz
-                    .partial_cmp(&right.theoretical_mz)
-                    .unwrap_or(Ordering::Equal)
-            })
+        left.neutral_loss.cmp(&right.neutral_loss).then_with(|| {
+            left.theoretical_mz
+                .partial_cmp(&right.theoretical_mz)
+                .unwrap_or(Ordering::Equal)
+        })
     });
 
     let entries = fragments
         .into_iter()
-        .map(|fragment| {
+        .filter_map(|fragment| {
             let matched = match_by_key.get(&fragment_key(fragment)).copied();
-            IonTableEntry {
-                text: ion_table_entry_text(fragment),
-                color: if matched.is_some() {
-                    series_color(series)
-                } else {
-                    COLOR_SERIES_NEUTRAL
-                },
-                title: ion_table_entry_title(fragment, matched),
-                matched: matched.is_some(),
+            if fragment.neutral_loss.is_some() && matched.is_none() {
+                return None;
             }
+            Some(SvgIonTableEntry {
+                series,
+                ordinal,
+                charge,
+                neutral_loss: fragment.neutral_loss,
+                mz: fragment.theoretical_mz,
+                detected: matched.is_some(),
+                title: ion_table_entry_title(fragment, matched),
+            })
         })
         .collect();
-    IonTableCell { entries }
+    SvgIonTableCell { entries }
 }
 
 fn fragment_key(fragment: &FragmentIon) -> IonKey {
@@ -2284,34 +2186,6 @@ fn fragment_key(fragment: &FragmentIon) -> IonKey {
         cleavage_index: fragment.cleavage_index,
         charge: fragment.charge,
         neutral_loss: fragment.neutral_loss,
-    }
-}
-
-fn neutral_loss_rank(loss: Option<NeutralLossKind>) -> u8 {
-    match loss {
-        None => 0,
-        Some(NeutralLossKind::PhosphoricAcid) => 1,
-        Some(NeutralLossKind::Water) => 2,
-        Some(NeutralLossKind::Ammonia) => 3,
-    }
-}
-
-fn ion_table_entry_text(fragment: &FragmentIon) -> String {
-    match fragment.neutral_loss {
-        None => format!("{:.2}", fragment.theoretical_mz),
-        Some(loss) => format!(
-            "{}{:.2}",
-            neutral_loss_short_label(loss),
-            fragment.theoretical_mz
-        ),
-    }
-}
-
-fn neutral_loss_short_label(loss: NeutralLossKind) -> &'static str {
-    match loss {
-        NeutralLossKind::Water => "w",
-        NeutralLossKind::Ammonia => "n",
-        NeutralLossKind::PhosphoricAcid => "p",
     }
 }
 
@@ -2331,299 +2205,6 @@ fn ion_table_entry_title(fragment: &FragmentIon, matched: Option<&FragmentMatch>
             fragment.label(),
             fragment.theoretical_mz,
         )
-    }
-}
-
-fn draw_ion_table(
-    file: &mut File,
-    left: f64,
-    top: f64,
-    width: f64,
-    height: f64,
-    report: &AnnotationReport,
-    rows: &[IonTableRow],
-) -> anyhow::Result<()> {
-    let row_height = ion_table_row_height(rows.len());
-    let font_size = ion_table_font_size(rows.len());
-    let column_gap = 14.0;
-    let layout = estimate_ion_table_layout(rows);
-    let pad = layout.pad;
-    let cut_width = layout.cut_width;
-    let show_charge2 = layout.value_columns == 4;
-    let value_width = (width - pad * 2.0 - cut_width - column_gap * layout.value_columns as f64)
-        / layout.value_columns as f64;
-    let table_bottom = top + height;
-    let title_y = top + 24.0;
-    let legend_y = top + 47.0;
-    let header_y = top + 76.0;
-    let row_start_y = top + 104.0;
-    let mut cursor = left + pad;
-    let b2_right = if show_charge2 {
-        let right = cursor + value_width;
-        cursor = right + column_gap;
-        Some(right)
-    } else {
-        None
-    };
-    let b1_right = cursor + value_width;
-    cursor = b1_right + column_gap;
-    let cut_left = cursor;
-    let cut_center = cut_left + cut_width / 2.0;
-    cursor = cut_left + cut_width + column_gap;
-    let y1_left = cursor;
-    cursor = y1_left + value_width + column_gap;
-    let y2_left = show_charge2.then_some(cursor);
-
-    writeln!(
-        file,
-        r##"<rect x="{x:.2}" y="{y:.2}" width="{w:.2}" height="{h:.2}" rx="8" fill="#f8fafc" stroke="#dbe2ea" stroke-width="1"/>"##,
-        x = left,
-        y = top,
-        w = width,
-        h = height,
-    )?;
-    writeln!(
-        file,
-        r##"<text x="{x:.2}" y="{y:.2}" font-family="Helvetica, Arial, sans-serif" font-size="{font}" fill="{fill}">Full ion table</text>"##,
-        x = left + pad,
-        y = title_y,
-        font = ION_TABLE_TITLE_FONT,
-        fill = COLOR_SUBTLE,
-    )?;
-    writeln!(
-        file,
-        r##"<text x="{x:.2}" y="{y:.2}" font-family="Helvetica, Arial, sans-serif" font-size="{font}" fill="{fill}">matched colored, missing grey; p/w/n = H3PO4/H2O/NH3</text>"##,
-        x = left + pad,
-        y = legend_y,
-        font = ION_TABLE_META_FONT,
-        fill = COLOR_SUBTLE,
-    )?;
-
-    let mut headers = Vec::new();
-    if let Some(x) = b2_right {
-        headers.push(("b++", x, "end"));
-    }
-    headers.push(("b+", b1_right, "end"));
-    headers.push(("cut", cut_center, "middle"));
-    headers.push(("y+", y1_left, "start"));
-    if let Some(x) = y2_left {
-        headers.push(("y++", x, "start"));
-    }
-    for (label, x, anchor) in headers {
-        writeln!(
-            file,
-            r##"<text x="{x:.2}" y="{y:.2}" font-family="{font_family}" font-size="{font_size:.1}" fill="{fill}" text-anchor="{anchor}">{label}</text>"##,
-            x = x,
-            y = header_y,
-            font_family = FONT_TABLE,
-            font_size = ION_TABLE_HEADER_FONT,
-            fill = COLOR_AXIS,
-            anchor = anchor,
-            label = label,
-        )?;
-    }
-    writeln!(
-        file,
-        r##"<line x1="{x1:.2}" y1="{y:.2}" x2="{x2:.2}" y2="{y:.2}" stroke="#dbe2ea" stroke-width="1"/>"##,
-        x1 = left + pad,
-        x2 = left + width - pad,
-        y = header_y + 6.0,
-    )?;
-
-    for (idx, row) in rows.iter().enumerate() {
-        let y = row_start_y + idx as f64 * row_height;
-        if y + row_height > table_bottom - 8.0 {
-            break;
-        }
-        if idx > 0 {
-            writeln!(
-                file,
-                r##"<line x1="{x1:.2}" y1="{y:.2}" x2="{x2:.2}" y2="{y:.2}" stroke="#eef2f6" stroke-width="1"/>"##,
-                x1 = left + pad,
-                x2 = left + width - pad,
-                y = y - row_height / 2.0 + 2.0,
-            )?;
-        }
-        if let Some(x) = b2_right {
-            write_ion_table_cell(file, x, y, "end", font_size, value_width, &row.b2.entries)?;
-        }
-        write_ion_table_cell(
-            file,
-            b1_right,
-            y,
-            "end",
-            font_size,
-            value_width,
-            &row.b1.entries,
-        )?;
-        writeln!(
-            file,
-            r##"<text x="{x:.2}" y="{y:.2}" font-family="{font}" font-size="{size:.1}" fill="{fill}" text-anchor="middle"><title>{title}</title>{text}</text>"##,
-            x = cut_center,
-            y = y,
-            font = FONT_TABLE,
-            size = font_size,
-            fill = COLOR_SUBTLE,
-            title = escape_xml(&format!("b{} / y{}", row.cleavage_index, row.y_ordinal)),
-            text = format!("{}|{}", row.cleavage_index, row.y_ordinal),
-        )?;
-        write_ion_table_cell(
-            file,
-            y1_left,
-            y,
-            "start",
-            font_size,
-            value_width,
-            &row.y1.entries,
-        )?;
-        if let Some(x) = y2_left {
-            write_ion_table_cell(file, x, y, "start", font_size, value_width, &row.y2.entries)?;
-        }
-    }
-
-    writeln!(
-        file,
-        r##"<text x="{x:.2}" y="{y:.2}" font-family="Helvetica, Arial, sans-serif" font-size="{font}" fill="{fill}">sequence: {sequence}</text>"##,
-        x = left + pad,
-        y = table_bottom - 14.0,
-        font = ION_TABLE_META_FONT,
-        fill = COLOR_SUBTLE,
-        sequence = escape_xml(report.context.peptide.sequence()),
-    )?;
-    Ok(())
-}
-
-fn write_ion_table_cell(
-    file: &mut File,
-    x: f64,
-    y: f64,
-    anchor: &str,
-    font_size: f64,
-    max_width: f64,
-    entries: &[IonTableEntry],
-) -> anyhow::Result<()> {
-    if entries.is_empty() {
-        return Ok(());
-    }
-
-    let title = ion_table_cell_title(entries);
-    let visible = ion_table_cell_visible_text(entries, font_size, max_width);
-    let fallback_fill = visible
-        .first()
-        .map(|(entry, _)| entry.color)
-        .unwrap_or(COLOR_SERIES_NEUTRAL);
-
-    writeln!(
-        file,
-        r##"<text x="{x:.2}" y="{y:.2}" font-family="{font}" font-size="{size:.1}" fill="{fill}" text-anchor="{anchor}"><title>{title}</title>"##,
-        x = x,
-        y = y,
-        font = FONT_TABLE,
-        size = font_size,
-        fill = fallback_fill,
-        anchor = anchor,
-        title = escape_xml(&title),
-    )?;
-    for (entry, text) in visible {
-        writeln!(
-            file,
-            r##"<tspan fill="{fill}">{text}</tspan>"##,
-            fill = entry.color,
-            text = escape_xml(&text),
-        )?;
-    }
-    writeln!(file, "</text>")?;
-    Ok(())
-}
-
-fn ion_table_cell_title(entries: &[IonTableEntry]) -> String {
-    entries
-        .iter()
-        .map(|entry| entry.title.as_str())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn ion_table_cell_visible_text<'a>(
-    entries: &'a [IonTableEntry],
-    font_size: f64,
-    max_width: f64,
-) -> Vec<(&'a IonTableEntry, String)> {
-    let budget = estimated_text_budget(font_size, max_width);
-    if budget == 0 {
-        return Vec::new();
-    }
-
-    let inline_entries = entries
-        .iter()
-        .take_while(|entry| entry.matched)
-        .count()
-        .max(1);
-    let mut remaining = budget;
-    let mut visible = Vec::new();
-
-    for (idx, entry) in entries.iter().enumerate().take(inline_entries) {
-        let prefix = if idx == 0 { "" } else { " " };
-        let available = remaining.saturating_sub(prefix.len());
-        if available == 0 {
-            break;
-        }
-        let Some(text) = truncate_ion_table_text(&entry.text, available) else {
-            break;
-        };
-        if idx > 0 && text == "…" {
-            break;
-        }
-        remaining = remaining.saturating_sub(prefix.len() + text.chars().count());
-        visible.push((entry, format!("{prefix}{text}")));
-        if text.ends_with('…') {
-            return visible;
-        }
-    }
-
-    if visible.len() < entries.len() {
-        if let Some((_, last_text)) = visible.last_mut() {
-            if !last_text.ends_with('…') {
-                *last_text = append_ellipsis(last_text);
-            }
-        } else if let Some(entry) = entries.first() {
-            visible.push((entry, "…".to_string()));
-        }
-    }
-
-    visible
-}
-
-fn estimated_text_budget(font_size: f64, max_width: f64) -> usize {
-    if !font_size.is_finite() || font_size <= 0.0 || !max_width.is_finite() || max_width <= 0.0 {
-        return 0;
-    }
-    ((max_width / (font_size * 0.62)).floor() as usize).max(1)
-}
-
-fn truncate_ion_table_text(text: &str, available: usize) -> Option<String> {
-    let len = text.chars().count();
-    if len <= available {
-        return Some(text.to_string());
-    }
-    if available == 0 {
-        return None;
-    }
-    if available == 1 {
-        return Some("…".to_string());
-    }
-
-    let keep = available - 1;
-    let truncated = text.chars().take(keep).collect::<String>();
-    Some(format!("{truncated}…"))
-}
-
-fn append_ellipsis(text: &str) -> String {
-    let trimmed = text.trim_end();
-    if trimmed.is_empty() || trimmed.ends_with('…') {
-        trimmed.to_string()
-    } else {
-        format!("{trimmed}…")
     }
 }
 
@@ -2653,10 +2234,16 @@ fn collect_peak_labels(
     for matches in grouped.into_values() {
         let mut sorted = matches;
         sorted.sort_by(|left, right| {
-            left.error_da
-                .abs()
-                .partial_cmp(&right.error_da.abs())
-                .unwrap_or(Ordering::Equal)
+            left.fragment
+                .neutral_loss
+                .is_some()
+                .cmp(&right.fragment.neutral_loss.is_some())
+                .then_with(|| {
+                    left.error_da
+                        .abs()
+                        .partial_cmp(&right.error_da.abs())
+                        .unwrap_or(Ordering::Equal)
+                })
                 .then_with(|| {
                     right
                         .observed_intensity
@@ -2677,13 +2264,13 @@ fn collect_peak_labels(
                 continue;
             }
             labels.push(PeakLabelText {
-                text: label_text.clone(),
+                series: matched.fragment.series,
+                ordinal: matched.fragment.ordinal,
+                charge: matched.fragment.charge,
+                neutral_loss: matched.fragment.neutral_loss,
                 color: series_color(matched.fragment.series),
                 title: format_match_title(matched),
             });
-            if labels.len() >= 2 {
-                break;
-            }
         }
 
         if labels.is_empty() {
@@ -2708,6 +2295,185 @@ fn collect_peak_labels(
             .unwrap_or(Ordering::Equal)
     });
     out
+}
+
+fn matched_peak_series(report: &AnnotationReport, observed_mz: f64) -> Option<FragmentSeries> {
+    report
+        .matches
+        .iter()
+        .filter(|matched| (matched.observed_mz - observed_mz).abs() <= 1.0e-6)
+        .min_by(|left, right| {
+            left.fragment
+                .neutral_loss
+                .is_some()
+                .cmp(&right.fragment.neutral_loss.is_some())
+                .then_with(|| {
+                    left.error_da
+                        .abs()
+                        .partial_cmp(&right.error_da.abs())
+                        .unwrap_or(Ordering::Equal)
+                })
+                .then_with(|| {
+                    fragment_series_order(left.fragment.series)
+                        .cmp(&fragment_series_order(right.fragment.series))
+                })
+        })
+        .map(|matched| matched.fragment.series)
+}
+
+fn fragment_series_order(series: FragmentSeries) -> u8 {
+    match series {
+        FragmentSeries::B => 0,
+        FragmentSeries::Y => 1,
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PlotLabelBounds {
+    left: f64,
+    right: f64,
+    top: f64,
+    bottom: f64,
+}
+
+impl PlotLabelBounds {
+    fn new(x: f64, baseline_y: f64, width: f64, font_size: f64) -> Self {
+        Self {
+            left: x - width / 2.0 - 3.0,
+            right: x + width / 2.0 + 3.0,
+            top: baseline_y - font_size - 2.0,
+            bottom: baseline_y + 4.0,
+        }
+    }
+
+    fn intersects(self, other: Self) -> bool {
+        self.left < other.right
+            && self.right > other.left
+            && self.top < other.bottom
+            && self.bottom > other.top
+    }
+}
+
+fn draw_fragment_peak_labels(
+    file: &mut File,
+    peak_labels: &[PeakLabel],
+    canvas: SvgCanvas,
+) -> anyhow::Result<()> {
+    let mut labels = peak_labels
+        .iter()
+        .flat_map(|peak| peak.labels.iter().map(move |label| (peak, label)))
+        .collect::<Vec<_>>();
+    labels.sort_by(|left, right| {
+        left.1
+            .neutral_loss
+            .is_some()
+            .cmp(&right.1.neutral_loss.is_some())
+            .then_with(|| {
+                right
+                    .0
+                    .display_intensity
+                    .partial_cmp(&left.0.display_intensity)
+                    .unwrap_or(Ordering::Equal)
+            })
+            .then_with(|| {
+                left.0
+                    .observed_mz
+                    .partial_cmp(&right.0.observed_mz)
+                    .unwrap_or(Ordering::Equal)
+            })
+    });
+
+    let mut occupied = Vec::<PlotLabelBounds>::new();
+    for (peak, label) in labels {
+        let (peak_x, peak_y) = canvas.transform(peak.observed_mz, peak.display_intensity);
+        let is_loss = label.neutral_loss.is_some();
+        let font_size = if is_loss {
+            11.0
+        } else {
+            PLOT_PEAK_LABEL_FONT as f64
+        };
+        let plain_len = 1
+            + label.ordinal.to_string().len()
+            + label
+                .neutral_loss
+                .map(|loss| loss.label().len() + 1)
+                .unwrap_or(0)
+            + if label.charge > 1 {
+                label.charge.to_string().len() + 1
+            } else {
+                0
+            };
+        let width = (plain_len as f64 * font_size * 0.62).max(18.0);
+        let (label_x, label_y) =
+            place_plot_label(peak_x, peak_y, width, font_size, canvas, &occupied);
+        occupied.push(PlotLabelBounds::new(label_x, label_y, width, font_size));
+
+        writeln!(
+            file,
+            r##"<line x1="{x1:.2}" y1="{y1:.2}" x2="{x2:.2}" y2="{y2:.2}" stroke="{stroke}" stroke-width="0.8" stroke-opacity="0.48"/>"##,
+            x1 = peak_x,
+            y1 = peak_y,
+            x2 = label_x,
+            y2 = label_y + 3.0,
+            stroke = label.color,
+        )?;
+        let markup = fragment_label_markup(
+            label.series,
+            label.ordinal,
+            label.charge,
+            label.neutral_loss,
+            true,
+        );
+        writeln!(
+            file,
+            r##"<text x="{x:.2}" y="{y:.2}" font-family="Helvetica, Arial, sans-serif" font-size="{font:.1}" font-weight="{weight}" fill="{fill}" fill-opacity="{opacity}" text-anchor="middle"><title>{title}</title>{markup}</text>"##,
+            x = label_x,
+            y = label_y,
+            font = font_size,
+            weight = if is_loss { "400" } else { "700" },
+            fill = label.color,
+            opacity = if is_loss { "0.76" } else { "1" },
+            title = escape_xml(&label.title),
+        )?;
+    }
+    Ok(())
+}
+
+fn place_plot_label(
+    peak_x: f64,
+    peak_y: f64,
+    width: f64,
+    font_size: f64,
+    canvas: SvgCanvas,
+    occupied: &[PlotLabelBounds],
+) -> (f64, f64) {
+    let top = canvas.top() + font_size + 3.0;
+    let preferred = (peak_y - 10.0).max(top);
+    let vertical_lanes = ((preferred - top) / 14.0).floor().max(0.0) as usize;
+    let horizontal_step = width + 8.0;
+    let x_offsets = [
+        0.0,
+        -horizontal_step,
+        horizontal_step,
+        -2.0 * horizontal_step,
+        2.0 * horizontal_step,
+    ];
+    for lane in 0..=vertical_lanes {
+        let y = preferred - lane as f64 * 14.0;
+        for offset in x_offsets {
+            let x = (peak_x + offset)
+                .max(canvas.left() + width / 2.0 + 2.0)
+                .min(canvas.right() - width / 2.0 - 2.0);
+            let bounds = PlotLabelBounds::new(x, y, width, font_size);
+            if occupied.iter().all(|other| !bounds.intersects(*other)) {
+                return (x, y);
+            }
+        }
+    }
+    let x = peak_x
+        .max(canvas.left() + width / 2.0 + 2.0)
+        .min(canvas.right() - width / 2.0 - 2.0);
+    (x, top)
 }
 
 fn should_render_match_label(
@@ -2737,10 +2503,7 @@ fn format_match_title(matched: &FragmentMatch) -> String {
 }
 
 fn series_color(series: FragmentSeries) -> &'static str {
-    match series {
-        FragmentSeries::B => COLOR_SERIES_B,
-        FragmentSeries::Y => COLOR_SERIES_Y,
-    }
+    ion_series_color(series)
 }
 
 fn sanitize_filename_component(input: &str) -> String {
@@ -3074,7 +2837,7 @@ mod tests {
     }
 
     #[test]
-    fn ion_table_rows_include_missing_and_neutral_loss_entries() {
+    fn ion_table_rows_keep_missing_base_ions_and_omit_missing_losses() {
         let context = prepare_annotation(
             "[+304.2071]SLES[+79.9663]DNEEK[+304.2071]/3",
             &[],
@@ -3088,20 +2851,19 @@ mod tests {
         )
         .expect("annotation context");
         let report = annotate_peaks(&context, None, &[], &[]);
-        let rows = build_ion_table_rows(&report);
-        assert_eq!(rows.len(), 8);
-        assert!(rows[3]
-            .b1
-            .entries
+        let table = build_ion_table(&report);
+        assert_eq!(table.rows.len(), 9);
+        assert_eq!(table.charges, vec![1, 2]);
+        let b1 = table.rows[0].b.get(&1).expect("b1 cell");
+        assert_eq!(b1.entries.len(), 1);
+        assert!(b1.entries[0].neutral_loss.is_none());
+        assert!(!b1.entries[0].detected);
+        assert!(table
+            .rows
             .iter()
-            .any(|entry| entry.text.starts_with('p')));
-        assert!(rows[0]
-            .y1
-            .entries
-            .iter()
-            .any(|entry| entry.color == COLOR_SERIES_NEUTRAL));
-        assert!(ion_table_has_charge2(&rows));
-        assert_eq!(estimate_ion_table_layout(&rows).value_columns, 4);
+            .flat_map(|row| row.b.values().chain(row.y.values()))
+            .flat_map(|cell| cell.entries.iter())
+            .all(|entry| entry.neutral_loss.is_none()));
     }
 
     #[test]
@@ -3109,43 +2871,22 @@ mod tests {
         let context = prepare_annotation("PEPTIDEK/2", &[], &[], Some(2), MassTolerance::Ppm(20.0))
             .expect("annotation context");
         let report = annotate_peaks(&context, None, &[], &[]);
-        let rows = build_ion_table_rows(&report);
+        let table = build_ion_table(&report);
 
-        assert!(!ion_table_has_charge2(&rows));
-        assert_eq!(estimate_ion_table_layout(&rows).value_columns, 2);
+        assert_eq!(table.charges, vec![1]);
+        assert!(table.rows.iter().all(|row| !row.b.contains_key(&2)));
     }
 
     #[test]
-    fn ion_table_cell_visible_text_prioritizes_matched_entries_and_preserves_full_title() {
-        let entries = vec![
-            IonTableEntry {
-                text: "123.45".to_string(),
-                color: COLOR_SERIES_B,
-                title: "b4 theoretical 123.4500 | observed 123.4501".to_string(),
-                matched: true,
-            },
-            IonTableEntry {
-                text: "p98.76".to_string(),
-                color: COLOR_SERIES_B,
-                title: "b4-H3PO4 theoretical 98.7600 | observed 98.7602".to_string(),
-                matched: true,
-            },
-            IonTableEntry {
-                text: "w105.32".to_string(),
-                color: COLOR_SERIES_NEUTRAL,
-                title: "b4-H2O theoretical 105.3200 | no matched peak within tolerance".to_string(),
-                matched: false,
-            },
-        ];
+    fn ion_table_includes_every_generated_fragment_charge() {
+        let context = prepare_annotation("PEPTIDEK/4", &[], &[], Some(4), MassTolerance::Ppm(20.0))
+            .expect("annotation context");
+        let report = annotate_peaks(&context, None, &[], &[]);
+        let table = build_ion_table(&report);
 
-        let visible = ion_table_cell_visible_text(&entries, 9.5, 52.0);
-        let rendered = visible
-            .iter()
-            .map(|(_, text)| text.as_str())
-            .collect::<String>();
-
-        assert_eq!(rendered, "123.45…");
-        assert_eq!(ion_table_cell_title(&entries).lines().count(), 3);
+        assert_eq!(table.charges, vec![1, 2, 3]);
+        assert!(table.rows[0].b.contains_key(&3));
+        assert!(table.rows[1].y.contains_key(&3));
     }
 
     #[test]

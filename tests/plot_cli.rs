@@ -201,9 +201,11 @@ fn plot_committed_hela_fixture_writes_ranked_outputs() {
     let json_paths = output_paths_with_extension(&exports_dir, "json");
     assert_eq!(svg_paths.len(), 3);
     assert_eq!(json_paths.len(), 3);
-    assert!(svg_paths
-        .iter()
-        .all(|path| path.file_name().unwrap().to_string_lossy().contains("rank")));
+    assert!(svg_paths.iter().all(|path| path
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .contains("rank")));
 
     let json = json_paths
         .iter()
@@ -267,9 +269,27 @@ fn plot_committed_phospho_fixture_writes_localization_outputs() {
     let json_paths = output_paths_with_extension(&exports_dir, "json");
     assert_eq!(svg_paths.len(), 5);
     assert_eq!(json_paths.len(), 5);
-    assert!(svg_paths
+    assert!(svg_paths.iter().all(|path| path
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .contains("nl-on")));
+    let rank1_svg_path = svg_paths
         .iter()
-        .all(|path| path.file_name().unwrap().to_string_lossy().contains("nl-on")));
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("rank1")
+        })
+        .expect("rank 1 SVG");
+    let rank1_svg = fs::read_to_string(rank1_svg_path).expect("read rank 1 SVG");
+    assert!(rank1_svg.contains("N  sequence  C"));
+    assert!(rank1_svg.contains("sequence: TGS[+79.966324]ESSQTGTSTTSSR"));
+    assert!(rank1_svg.contains("phosphoric acid"));
+    assert!(rank1_svg.contains("spectrum-peak-matched-b"));
+    assert!(rank1_svg.contains("spectrum-peak-matched-y"));
+    assert!(!rank1_svg.contains("+p"));
 
     let json = json_paths
         .iter()
@@ -363,9 +383,12 @@ fn plot_writes_annotated_svg() {
     assert!(svg.contains("frag_error_mae_ppm="));
     assert!(svg.contains("class=\"ladder-index\""));
     assert!(svg.contains("Full ion table"));
-    assert!(svg.contains("matched colored, missing grey; p/w/n = H3PO4/H2O/NH3"));
-    assert!(!svg.contains(">b++<"));
-    assert!(!svg.contains(">y++<"));
+    assert!(svg.contains("colored = matched evidence; grey = unmatched theoretical base ion"));
+    assert!(svg.contains("loss lines = matched evidence:"));
+    assert!(svg.contains("N  sequence  C"));
+    assert!(!svg.contains("+w"));
+    assert!(!svg.contains("+n"));
+    assert!(!svg.contains("+p"));
 
     let _ = fs::remove_file(svg_path);
 }
